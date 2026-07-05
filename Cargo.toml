@@ -1,0 +1,36 @@
+[package]
+name = "coolviz"
+version = "0.1.0"
+edition = "2024"
+description = "LIVE EARTH — a mission-control globe: live wind, satellites, quakes, clouds. Native Rust + wgpu."
+license = "MIT"
+repository = "https://github.com/uky007/coolviz"
+
+[dependencies]
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.35"
+egui-wgpu = "0.35"
+wgpu = "29"
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+ureq = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sgp4 = "2"
+gribberish = "1.4"
+chrono = "0.4"
+rayon = "1"
+flate2 = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+fastrand = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,740 @@
+//! COOLVIZ // LIVE EARTH — a mission-control globe: live wind, satellites,
+//! earthquakes. Cool for coolness' sake.
+//!
+//! Run the app:            cargo run --release
+//! Headless screenshot:    cargo run --release -- --shot out.png
+//!                         [--frames 240] [--size 1920x1080]
+//!                         [--lat 26] [--lon 136] [--dist 3.3]
+
+mod astro;
+mod camera;
+mod data;
+mod scene;
+
+use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
+
+use chrono::Utc;
+use eframe::egui;
+
+use camera::OrbitCamera;
+use data::{DataMsg, QuakeCpu, Source};
+use scene::{FrameInput, Scene, SceneAssets};
+
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(84, 220, 255);
+const DIM: egui::Color32 = egui::Color32::from_rgb(110, 138, 158);
+const LIGHT: egui::Color32 = egui::Color32::from_rgb(198, 219, 232);
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn load_assets() -> anyhow::Result<SceneAssets> {
+    let t0 = Instant::now();
+    let (coast_vertices, coast_indices) = data::coast::load()?;
+    let (land_w, land_h, land_mask) = data::landmask::build(2048, 1024)?;
+    log::info!(
+        "assets ready in {:.0?} ({} coast vertices)",
+        t0.elapsed(),
+        coast_vertices.len()
+    );
+    Ok(SceneAssets {
+        land_w,
+        land_h,
+        land_mask,
+        coast_vertices,
+        coast_indices,
+    })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuakeGpu {
+    pos: [f32; 4],
+    meta: [f32; 4],
+}
+
+fn pack_quakes(list: &[QuakeCpu], app_epoch_unix: f64) -> Vec<QuakeGpu> {
+    list.iter()
+        .map(|q| {
+            let p = astro::latlon_to_world(q.lat, q.lon) * 1.004;
+            let t_rel = (q.unix_ms as f64 / 1000.0 - app_epoch_unix) as f32;
+            let hash = (q.unix_ms % 997) as f32 / 997.0;
+            QuakeGpu {
+                pos: [p.x, p.y, p.z, q.mag],
+                meta: [t_rel, hash, 0.0, 0.0],
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------- app ----
+
+struct Status {
+    wind: Option<(Source, String)>,
+    sats: Option<(Source, String, usize)>,
+    quakes: Option<(String, usize)>,
+    clouds: Option<String>,
+}
+
+struct App {
+    scene: Scene,
+    cam: OrbitCamera,
+    rx: Receiver<DataMsg>,
+    status: Status,
+    app_epoch_unix: f64,
+    last_frame: Instant,
+    frame_index: u32,
+    fps: f32,
+    sat_t0_unix: Option<f64>,
+    iss: Option<([f32; 3], [f32; 3])>,
+    tex: Option<(egui::TextureId, (u32, u32))>,
+    // UI state
+    show_wind: bool,
+    show_sats: bool,
+    show_quakes: bool,
+    show_coast: bool,
+    show_clouds: bool,
+    particle_count_k: u32,
+    warp: f32,
+    trail_gain: f32,
+    exposure: f32,
+    show_hud: bool,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>, assets: SceneAssets) -> Self {
+        let rs = cc
+            .wgpu_render_state
+            .as_ref()
+            .expect("coolviz requires the wgpu backend");
+        apply_style(&cc.egui_ctx);
+        let scene = Scene::new(&rs.device, &rs.queue, &assets);
+        let (tx, rx) = std::sync::mpsc::channel();
+        data::spawn(tx);
+        let now = Utc::now();
+        Self {
+            scene,
+            cam: OrbitCamera::new(),
+            rx,
+            status: Status {
+                wind: None,
+                sats: None,
+                quakes: None,
+                clouds: None,
+            },
+            app_epoch_unix: astro::unix_seconds(now),
+            last_frame: Instant::now(),
+            frame_index: 0,
+            fps: 60.0,
+            sat_t0_unix: None,
+            iss: None,
+            tex: None,
+            show_wind: true,
+            show_sats: true,
+            show_quakes: true,
+            show_coast: true,
+            show_clouds: true,
+            particle_count_k: 600,
+            warp: 6000.0,
+            trail_gain: 1.0,
+            exposure: 1.15,
+            show_hud: true,
+        }
+    }
+
+    fn drain_data(&mut self, rs: &egui_wgpu::RenderState) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                DataMsg::Wind {
+                    w,
+                    h,
+                    data,
+                    label,
+                    source,
+                } => {
+                    self.scene.upload_wind(&rs.device, &rs.queue, w, h, &data);
+                    self.status.wind = Some((source, label));
+                }
+                DataMsg::Sats {
+                    t0_unix,
+                    states,
+                    label,
+                    source,
+                } => {
+                    let n = states.len();
+                    self.iss = states
+                        .iter()
+                        .find(|s| s.pos[3] as u32 == 4)
+                        .map(|s| {
+                            (
+                                [s.pos[0], s.pos[1], s.pos[2]],
+                                [s.vel[0], s.vel[1], s.vel[2]],
+                            )
+                        });
+                    self.scene
+                        .upload_sats(&rs.device, &rs.queue, bytemuck::cast_slice(&states));
+                    self.sat_t0_unix = Some(t0_unix);
+                    self.status.sats = Some((source, label, n));
+                }
+                DataMsg::Quakes { list, label } => {
+                    let packed = pack_quakes(&list, self.app_epoch_unix);
+                    let n = packed.len();
+                    self.scene
+                        .upload_quakes(&rs.device, &rs.queue, bytemuck::cast_slice(&packed));
+                    self.status.quakes = Some((label, n));
+                }
+                DataMsg::Clouds { w, h, rgba, label } => {
+                    self.scene.upload_clouds(&rs.device, &rs.queue, w, h, &rgba);
+                    self.status.clouds = Some(label);
+                }
+                DataMsg::Note(s) => log::info!("{s}"),
+            }
+        }
+    }
+
+    fn frame_input(&self, px: (u32, u32), dt: f32) -> FrameInput {
+        let aspect = px.0 as f32 / px.1.max(1) as f32;
+        let (vp, ivp, eye) = self.cam.matrices(aspect);
+        let utc = Utc::now();
+        let unix = astro::unix_seconds(utc);
+        let sat_dt = self.sat_t0_unix.map(|t0| (unix - t0) as f32).unwrap_or(0.0);
+        FrameInput {
+            view_proj: vp,
+            inv_view_proj: ivp,
+            cam_pos: eye,
+            sun_dir: astro::sun_dir_world(utc),
+            time: (unix - self.app_epoch_unix) as f32,
+            sat_dt,
+            trail_gain: self.trail_gain,
+            exposure: self.exposure,
+            res_scale: (px.1 as f32 / 1200.0).clamp(0.5, 3.0),
+            layers: [
+                if self.show_wind { 1.0 } else { 0.0 },
+                if self.show_sats { 1.0 } else { 0.0 },
+                if self.show_quakes { 1.0 } else { 0.0 },
+                if self.show_coast { 1.0 } else { 0.0 },
+            ],
+            clouds: if self.show_clouds { 1.0 } else { 0.0 },
+            sim_dt: dt.clamp(0.001, 0.05),
+            warp: self.warp,
+            trail_fade: lerp(0.958, 0.85, self.cam.motion.min(1.0)),
+            frame_index: self.frame_index,
+        }
+    }
+
+    fn hud(&mut self, ctx: &egui::Context, rs: &egui_wgpu::RenderState) {
+        let frame = egui::Frame::NONE
+            .fill(egui::Color32::from_rgba_unmultiplied(5, 12, 20, 216))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(26, 62, 86)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(12));
+
+        egui::Window::new("coolviz-hud")
+            .title_bar(false)
+            .resizable(false)
+            .default_pos([16.0, 14.0])
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 5.0;
+                ui.label(
+                    egui::RichText::new("COOLVIZ ▸ LIVE EARTH")
+                        .monospace()
+                        .size(15.0)
+                        .strong()
+                        .color(ACCENT),
+                );
+                ui.label(
+                    egui::RichText::new(format!("{}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")))
+                        .monospace()
+                        .size(11.5)
+                        .color(DIM),
+                );
+                ui.separator();
+
+                match &self.status.wind {
+                    Some((src, label)) => {
+                        status_row(ui, "WIND", source_color(*src), format!("{label} · {}", src.tag()))
+                    }
+                    None => status_row(ui, "WIND", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                }
+                match &self.status.sats {
+                    Some((src, label, _n)) => {
+                        status_row(ui, "SATS", source_color(*src), format!("{label} · {}", src.tag()))
+                    }
+                    None => status_row(ui, "SATS", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                }
+                match &self.status.quakes {
+                    Some((label, _n)) => status_row(
+                        ui,
+                        "QUAKES",
+                        egui::Color32::from_rgb(255, 150, 70),
+                        label.clone(),
+                    ),
+                    None => status_row(ui, "QUAKES", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                }
+                match &self.status.clouds {
+                    Some(label) => {
+                        let c = if label.contains("(cache)") {
+                            egui::Color32::from_rgb(255, 210, 100)
+                        } else {
+                            egui::Color32::from_rgb(70, 225, 255)
+                        };
+                        status_row(ui, "CLOUDS", c, label.clone());
+                    }
+                    None => status_row(ui, "CLOUDS", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_wind, "wind");
+                    ui.checkbox(&mut self.show_sats, "sats");
+                    ui.checkbox(&mut self.show_quakes, "quakes");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.show_clouds, "clouds");
+                    ui.checkbox(&mut self.show_coast, "coast");
+                    ui.checkbox(&mut self.cam.auto_orbit, "auto-orbit");
+                });
+                ui.add_space(2.0);
+
+                let resp = ui.add(
+                    egui::Slider::new(&mut self.particle_count_k, 100..=2000)
+                        .logarithmic(true)
+                        .suffix("k")
+                        .text("particles"),
+                );
+                if resp.drag_stopped() || resp.lost_focus() {
+                    self.scene
+                        .set_particle_count(&rs.device, self.particle_count_k * 1000);
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.warp, 1000.0..=15000.0)
+                        .logarithmic(true)
+                        .text("wind ×"),
+                );
+                ui.add(egui::Slider::new(&mut self.trail_gain, 0.0..=2.0).text("trails"));
+                ui.add(egui::Slider::new(&mut self.exposure, 0.5..=2.5).text("exposure"));
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{:>5.1} fps · {} particles · {} sats",
+                        self.fps,
+                        self.scene.particles.count,
+                        self.scene.sats.count,
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(DIM),
+                );
+            });
+    }
+}
+
+fn status_row(ui: &mut egui::Ui, name: &str, dot: egui::Color32, text: String) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("●").size(10.0).color(dot));
+        ui.label(
+            egui::RichText::new(format!("{name:<7}"))
+                .monospace()
+                .size(11.5)
+                .color(LIGHT),
+        );
+        ui.label(egui::RichText::new(text).monospace().size(11.5).color(DIM));
+    });
+}
+
+fn source_color(s: Source) -> egui::Color32 {
+    match s {
+        Source::Live => egui::Color32::from_rgb(70, 225, 255),
+        Source::Cache | Source::Snapshot => egui::Color32::from_rgb(255, 210, 100),
+        Source::Synthetic => egui::Color32::from_rgb(255, 140, 90),
+    }
+}
+
+fn apply_style(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = egui::Color32::from_rgb(2, 4, 8);
+    v.window_fill = egui::Color32::from_rgba_unmultiplied(5, 12, 20, 216);
+    v.selection.bg_fill = egui::Color32::from_rgb(16, 96, 128);
+    v.slider_trailing_fill = true;
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(16, 30, 42);
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(24, 48, 66);
+    v.widgets.active.bg_fill = egui::Color32::from_rgb(20, 70, 96);
+    ctx.set_visuals(v);
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        self.frame_index = self.frame_index.wrapping_add(1);
+        if dt > 0.0 {
+            self.fps = self.fps * 0.95 + 0.05 / dt.max(1e-4);
+        }
+
+        let rs = frame
+            .wgpu_render_state()
+            .expect("wgpu render state")
+            .clone();
+
+        self.drain_data(&rs);
+
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        let ppp = ctx.pixels_per_point();
+        let px = (
+            ((avail.x * ppp).round() as u32).max(8),
+            ((avail.y * ppp).round() as u32).max(8),
+        );
+
+        let drag = if resp.dragged() {
+            let d = resp.drag_delta();
+            (d.x, d.y)
+        } else {
+            (0.0, 0.0)
+        };
+        let (scroll, pinch) = if resp.hovered() {
+            ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()))
+        } else {
+            (0.0, 1.0)
+        };
+        if resp.double_clicked() {
+            self.cam.reset();
+        }
+        self.cam.update(dt, drag, scroll, pinch, avail.y);
+
+        let fi = self.frame_input(px, dt);
+        let view = self.scene.render(&rs.device, &rs.queue, px, &fi);
+
+        let need_register = match self.tex {
+            Some((_, s)) => s != px,
+            None => true,
+        };
+        if need_register {
+            let mut renderer = rs.renderer.write();
+            if let Some((old, _)) = self.tex.take() {
+                renderer.free_texture(&old);
+            }
+            let id = renderer.register_native_texture(&rs.device, view, wgpu::FilterMode::Linear);
+            self.tex = Some((id, px));
+        }
+        if let Some((id, _)) = self.tex {
+            ui.painter().image(
+                id,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // ISS marker + label, projected and occlusion-tested on the CPU.
+        if self.show_sats && self.show_hud {
+            if let Some((p, v)) = self.iss {
+                let wp = glam::Vec3::from(p) + glam::Vec3::from(v) * fi.sat_dt;
+                let cam = fi.cam_pos;
+                let to = wp - cam;
+                let dist = to.length();
+                let dir = to / dist.max(1e-6);
+                let t_close = -cam.dot(dir);
+                let hidden = t_close > 0.0
+                    && t_close < dist
+                    && (cam + dir * t_close).length() < 0.995;
+                if !hidden {
+                    let clip = fi.view_proj * wp.extend(1.0);
+                    if clip.w > 0.0 {
+                        let ndc = clip.truncate() / clip.w;
+                        if ndc.x.abs() < 1.05 && ndc.y.abs() < 1.05 {
+                            let sp = egui::pos2(
+                                rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+                                rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
+                            );
+                            let c = egui::Color32::from_rgb(215, 246, 255);
+                            let painter = ui.painter();
+                            painter.circle_stroke(sp, 7.0, egui::Stroke::new(1.2, c));
+                            let alt_km = (wp.length() - 1.0) * 6371.0;
+                            let spd = glam::Vec3::from(v).length() * 6371.0;
+                            painter.text(
+                                sp + egui::vec2(11.0, -11.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!("ISS · {alt_km:.0} km · {spd:.2} km/s"),
+                                egui::FontId::monospace(11.0),
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if resp.clicked_by(egui::PointerButton::Secondary) {
+            self.show_hud = !self.show_hud;
+        }
+
+        if self.show_hud {
+            self.hud(&ctx, &rs);
+            egui::Area::new(egui::Id::new("hint"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-14.0, -10.0])
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "drag rotate · scroll zoom · double-click reset · right-click hud",
+                        )
+                        .monospace()
+                        .size(10.5)
+                        .color(egui::Color32::from_rgba_unmultiplied(140, 170, 190, 140)),
+                    );
+                });
+        }
+
+        ctx.request_repaint();
+    }
+}
+
+// ------------------------------------------------------------- headless ----
+
+struct ShotOpts {
+    path: PathBuf,
+    frames: u32,
+    size: (u32, u32),
+    lat: f32,
+    lon: f32,
+    dist: f32,
+    framedump: Option<PathBuf>,
+    spin: f32,
+    warmup: u32,
+}
+
+fn read_final(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &Scene,
+    w: u32,
+    h: u32,
+) -> anyhow::Result<image::RgbaImage> {
+    use anyhow::Context as _;
+    let bpr = (w * 4).next_multiple_of(256);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bpr as u64 * h as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let tex = scene.final_texture().context("no final texture")?;
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(enc.finish()));
+    let slice = buf.slice(..);
+    let (s, r) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        s.send(res).ok();
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    r.recv()??;
+    let mapped = slice.get_mapped_range();
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        let row = &mapped[(y * bpr) as usize..(y * bpr + w * 4) as usize];
+        for x in 0..w {
+            let i = (x * 4) as usize;
+            img.put_pixel(x, y, image::Rgba([row[i], row[i + 1], row[i + 2], 255]));
+        }
+    }
+    Ok(img)
+}
+
+fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .context("no GPU adapter")?;
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .context("no device")?;
+
+    let mut scene = Scene::new(&device, &queue, &assets);
+    let app_epoch_unix = astro::unix_seconds(Utc::now());
+
+    match data::wind::load_snapshot() {
+        Ok(g) => {
+            log::info!("shot: wind {} ({})", g.label, g.source.tag());
+            scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
+        }
+        Err(e) => {
+            log::warn!("shot: wind snapshot failed ({e:#}), using synthetic");
+            let g = data::wind::synthetic();
+            scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
+        }
+    }
+    let (states, sat_t0, label, source) = data::sats::offline_states();
+    log::info!("shot: {} sats ({} · {})", states.len(), label, source.tag());
+    scene.upload_sats(&device, &queue, bytemuck::cast_slice(&states));
+    match data::quakes::fetch_once() {
+        Ok((list, label)) => {
+            log::info!("shot: quakes {label}");
+            let packed = pack_quakes(&list, app_epoch_unix);
+            scene.upload_quakes(&device, &queue, bytemuck::cast_slice(&packed));
+        }
+        Err(e) => log::warn!("shot: quakes unavailable ({e})"),
+    }
+    if let Some(c) = data::himawari::fetch_once() {
+        log::info!("shot: clouds {}", c.label);
+        scene.upload_clouds(&device, &queue, c.w, c.h, &c.rgba);
+    }
+
+    let mut cam = OrbitCamera::new();
+    cam.lat = o.lat;
+    cam.lon = o.lon;
+    cam.dist = o.dist;
+    cam.auto_orbit = false;
+
+    if let Some(dir) = &o.framedump {
+        std::fs::create_dir_all(dir)?;
+    }
+    let total = o.frames + if o.framedump.is_some() { o.warmup } else { 0 };
+    let dt = 1.0 / 60.0;
+    for i in 0..total {
+        cam.lon += o.spin * dt;
+        cam.update(dt, (0.0, 0.0), 0.0, 1.0, o.size.1 as f32);
+        let aspect = o.size.0 as f32 / o.size.1 as f32;
+        let (vp, ivp, eye) = cam.matrices(aspect);
+        let utc = Utc::now();
+        let unix = astro::unix_seconds(utc);
+        let fi = FrameInput {
+            view_proj: vp,
+            inv_view_proj: ivp,
+            cam_pos: eye,
+            sun_dir: astro::sun_dir_world(utc),
+            time: (unix - app_epoch_unix) as f32,
+            sat_dt: (unix - sat_t0) as f32,
+            trail_gain: 1.0,
+            exposure: 1.15,
+            res_scale: (o.size.1 as f32 / 1200.0).clamp(0.5, 3.0),
+            layers: [1.0, 1.0, 1.0, 1.0],
+            clouds: 1.0,
+            sim_dt: dt,
+            warp: 6000.0,
+            trail_fade: 0.958,
+            frame_index: i,
+        };
+        scene.render(&device, &queue, o.size, &fi);
+        if let Some(dir) = &o.framedump {
+            if i >= o.warmup {
+                let img = read_final(&device, &queue, &scene, o.size.0, o.size.1)?;
+                img.save(dir.join(format!("{:04}.png", i - o.warmup)))?;
+            }
+        }
+    }
+
+    let img = read_final(&device, &queue, &scene, o.size.0, o.size.1)?;
+    img.save(&o.path)?;
+    println!("saved {}", o.path.display());
+    Ok(())
+}
+
+// ----------------------------------------------------------------- main ----
+
+fn main() -> anyhow::Result<()> {
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+            .default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn,zbus=warn"),
+    )
+    .init();
+
+    let mut shot: Option<PathBuf> = None;
+    let mut frames = 240u32;
+    let mut size = (1920u32, 1080u32);
+    let (mut lat, mut lon, mut dist) = (26.0f32, 136.0f32, 3.3f32);
+    let mut framedump: Option<PathBuf> = None;
+    let mut spin = 0.0f32;
+    let mut warmup = 150u32;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--shot" => {
+                shot = Some(PathBuf::from(
+                    args.next().unwrap_or_else(|| "shot.png".into()),
+                ))
+            }
+            "--frames" => frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(frames),
+            "--size" => {
+                if let Some(s) = args.next() {
+                    if let Some((a, b)) = s.split_once('x') {
+                        if let (Ok(a), Ok(b)) = (a.parse(), b.parse()) {
+                            size = (a, b);
+                        }
+                    }
+                }
+            }
+            "--lat" => lat = args.next().and_then(|s| s.parse().ok()).unwrap_or(lat),
+            "--lon" => lon = args.next().and_then(|s| s.parse().ok()).unwrap_or(lon),
+            "--dist" => dist = args.next().and_then(|s| s.parse().ok()).unwrap_or(dist),
+            "--framedump" => framedump = args.next().map(PathBuf::from),
+            "--spin" => spin = args.next().and_then(|s| s.parse().ok()).unwrap_or(spin),
+            "--warmup" => warmup = args.next().and_then(|s| s.parse().ok()).unwrap_or(warmup),
+            other => log::warn!("unknown arg: {other}"),
+        }
+    }
+
+    let assets = load_assets()?;
+
+    if let Some(path) = shot {
+        return run_shot(
+            &ShotOpts {
+                path,
+                frames,
+                size,
+                lat,
+                lon,
+                dist,
+                framedump,
+                spin,
+                warmup,
+            },
+            assets,
+        );
+    }
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1500.0, 950.0])
+            .with_min_inner_size([900.0, 560.0])
+            .with_title("COOLVIZ // LIVE EARTH"),
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "coolviz",
+        options,
+        Box::new(move |cc| Ok(Box::new(App::new(cc, assets)))),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+}
