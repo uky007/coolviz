@@ -38,10 +38,39 @@ pub struct BuildingInfo {
     pub name: String,
     pub usage: String,
     pub address: String,
+    pub structure: String,
     pub floors: i32,
     pub floors_below: i32,
     pub height: f32,
+    /// Worst-case flood depth (m) across all hazard layers, and its source.
+    pub flood: f32,
+    pub flood_src: String,
 }
+
+const FLOOD_KEYS: [(&str, &str); 7] = [
+    ("荒川水系荒川洪水浸水想定区域_想定最大規模_浸水深", "荒川"),
+    (
+        "利根川水系利根川洪水浸水想定区域_想定最大規模_浸水深",
+        "利根川",
+    ),
+    (
+        "利根川水系江戸川洪水浸水想定区域_想定最大規模_浸水深",
+        "江戸川",
+    ),
+    ("神田川流域浸水予想区域_想定最大規模_浸水深", "神田川"),
+    (
+        "江東内部河川流域浸水予想区域_想定最大規模_浸水深",
+        "江東内部河川",
+    ),
+    (
+        "城南地区河川流域浸水予想区域（改定）_想定最大規模_浸水深",
+        "城南地区河川",
+    ),
+    (
+        "石神井川及び白子川流域浸水予想区域_想定最大規模_浸水深",
+        "石神井川・白子川",
+    ),
+];
 
 fn bt_str(bt: &serde_json::Value, key: &str, i: usize) -> String {
     bt[key]
@@ -405,15 +434,28 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
         .into_iter()
         .map(|(bid, (min, max))| {
             let i = bid as usize;
+            let mut flood = 0.0f32;
+            let mut flood_src = String::new();
+            for (key, label) in FLOOD_KEYS {
+                if let Some(d) = bt_num(&bt, btbin, key, i)
+                    && d as f32 > flood
+                {
+                    flood = d as f32;
+                    flood_src = label.to_string();
+                }
+            }
             BuildingInfo {
                 min,
                 max,
                 name: bt_str(&bt, "名称", i),
                 usage: bt_str(&bt, "用途", i),
                 address: bt_str(&bt, "住所", i),
+                structure: bt_str(&bt, "建物構造", i),
                 floors: bt_num(&bt, btbin, "地上階数", i).unwrap_or(-1.0) as i32,
                 floors_below: bt_num(&bt, btbin, "地下階数", i).unwrap_or(0.0) as i32,
                 height: bt_num(&bt, btbin, "計測高さ", i).unwrap_or(0.0) as f32,
+                flood,
+                flood_src,
             }
         })
         .collect();

@@ -301,6 +301,7 @@ impl App {
             .as_ref()
             .expect("coolviz requires the wgpu backend");
         apply_style(&cc.egui_ctx);
+        install_jp_font(&cc.egui_ctx);
         let scene = Scene::new(&rs.device, &rs.queue, &assets);
         let (tx, rx) = std::sync::mpsc::channel();
         data::spawn(tx.clone());
@@ -764,6 +765,34 @@ fn source_color(s: Source) -> egui::Color32 {
     }
 }
 
+/// Load a system CJK font so building names and addresses render properly.
+fn install_jp_font(ctx: &egui::Context) {
+    let candidates = [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W4.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("jp".into(), egui::FontData::from_owned(bytes).into());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(family).or_default().push("jp".into());
+            }
+            ctx.set_fonts(fonts);
+            log::info!("Japanese font loaded from {path}");
+            return;
+        }
+    }
+    log::warn!("no CJK font found; Japanese labels may not render");
+}
+
 fn apply_style(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = egui::Color32::from_rgb(2, 4, 8);
@@ -956,11 +985,17 @@ impl eframe::App for App {
                     if !b.usage.is_empty() {
                         spec.push(b.usage.clone());
                     }
+                    if !b.structure.is_empty() {
+                        spec.push(b.structure.clone());
+                    }
                     if !spec.is_empty() {
                         lines.push(spec.join(" · "));
                     }
                     if !b.address.is_empty() {
                         lines.push(b.address.clone());
+                    }
+                    if b.flood >= 0.05 {
+                        lines.push(format!("⚠ 想定最大浸水 {:.1}m（{}）", b.flood, b.flood_src));
                     }
                 } else if ray_dir.y < -1e-4 {
                     let t = -cam.y / ray_dir.y;
