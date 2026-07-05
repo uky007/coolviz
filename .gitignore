@@ -4,3 +4,4 @@
 *.png
 !docs/*.png
 *.mp4
+.DS_Store
