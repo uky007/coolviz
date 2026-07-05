@@ -8,17 +8,27 @@ use glam::DVec3;
 
 use super::{cache_path, http_get};
 
-pub const TILESET_URL: &str = "https://plateau.geospatial.jp/main/data/3d-tiles/bldg/13100_tokyo/13101_chiyoda-ku/notexture/tileset.json";
+pub const TILESET_URL: &str = "https://plateau.geospatial.jp/main/data/3d-tiles/bldg/13100_tokyo/13101_chiyoda-ku/texture/tileset.json";
 /// Tokyo Station plaza.
 pub const SITE_LON: f64 = 139.7660;
 pub const SITE_LAT: f64 = 35.6812;
 /// Half-size of the loaded square, in degrees of latitude (~1.6 km).
 const LOAD_RADIUS_DEG: f64 = 0.015;
 
-pub struct CityMesh {
-    /// x,y,z in meters (ENU world), plus a per-building hash in w.
-    pub verts: Vec<[f32; 4]>,
+pub const ATLAS_SIZE: u32 = 1024;
+const CELL: u32 = 128;
+const GRID: u32 = ATLAS_SIZE / CELL; // 8x8 = 64 slots per tile
+
+/// One 3D Tiles content tile: geometry + a packed facade-photo atlas.
+pub struct CityTile {
+    /// x,y,z meters (ENU world), atlas u, atlas v, per-building hash.
+    pub verts: Vec<[f32; 6]>,
     pub indices: Vec<u32>,
+    pub atlas: Vec<u8>, // ATLAS_SIZE^2 RGBA
+}
+
+pub struct CityMesh {
+    pub tiles: Vec<CityTile>,
     pub label: String,
 }
 
@@ -122,6 +132,18 @@ fn accessor_info(glb: &Glb, idx: usize) -> anyhow::Result<(usize, usize, usize, 
     Ok((bv_off + acc_off, count, ctype, comps, stride))
 }
 
+fn read_vec2(glb: &Glb, idx: usize) -> anyhow::Result<Vec<[f32; 2]>> {
+    let (off, count, ctype, comps, stride) = accessor_info(glb, idx)?;
+    anyhow::ensure!(ctype == 5126 && comps == 2, "expected f32 vec2");
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let p = off + i * stride;
+        let read = |o: usize| f32::from_le_bytes(glb.bin[o..o + 4].try_into().unwrap());
+        out.push([read(p), read(p + 4)]);
+    }
+    Ok(out)
+}
+
 fn read_vec3(glb: &Glb, idx: usize) -> anyhow::Result<Vec<[f32; 3]>> {
     let (off, count, ctype, comps, stride) = accessor_info(glb, idx)?;
     anyhow::ensure!(ctype == 5126 && comps == 3, "expected f32 vec3");
@@ -176,7 +198,8 @@ fn hash01(x: u32) -> f32 {
 
 // ---- b3dm ----
 
-fn append_b3dm(bytes: &[u8], enu: &Enu, tile_seed: u32, mesh: &mut CityMesh) -> anyhow::Result<()> {
+/// Decode one textured b3dm into geometry + a packed facade atlas.
+fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTile> {
     anyhow::ensure!(bytes.len() > 28 && &bytes[0..4] == b"b3dm", "not b3dm");
     let u32at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
     let (ftj, ftb, btj, btb) = (u32at(12), u32at(16), u32at(20), u32at(24));
@@ -193,6 +216,62 @@ fn append_b3dm(bytes: &[u8], enu: &Enu, tile_seed: u32, mesh: &mut CityMesh) -> 
         })
         .unwrap_or(DVec3::ZERO);
 
+    let mut tile = CityTile {
+        verts: Vec::new(),
+        indices: Vec::new(),
+        atlas: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+    };
+    for px in tile.atlas.chunks_exact_mut(4) {
+        px.copy_from_slice(&[54, 58, 66, 255]); // untextured fallback: dark facade
+    }
+
+    // Material -> atlas slot, decoding each referenced JPEG once.
+    let mut mat_slot: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let mut next_slot: u32 = 1; // slot 0 stays the flat fallback color
+    let mut slot_of = |mat: usize, glb: &Glb, atlas: &mut [u8]| -> u32 {
+        if let Some(&s) = mat_slot.get(&mat) {
+            return s;
+        }
+        let slots = GRID * GRID;
+        let mut slot = 0u32;
+        let tex_idx =
+            glb.json["materials"][mat]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                .as_u64();
+        if let Some(ti) = tex_idx
+            && next_slot < slots
+        {
+            let src = glb.json["textures"][ti as usize]["source"].as_u64();
+            if let Some(si) = src {
+                let bv = &glb.json["images"][si as usize]["bufferView"];
+                if let Some(bvi) = bv.as_u64() {
+                    let view = &glb.json["bufferViews"][bvi as usize];
+                    let off = view["byteOffset"].as_u64().unwrap_or(0) as usize;
+                    let len = view["byteLength"].as_u64().unwrap_or(0) as usize;
+                    if off + len <= glb.bin.len()
+                        && let Ok(img) = image::load_from_memory(&glb.bin[off..off + len])
+                    {
+                        let small = img
+                            .resize_exact(CELL, CELL, image::imageops::FilterType::Triangle)
+                            .to_rgba8();
+                        slot = next_slot;
+                        next_slot += 1;
+                        let cx = (slot % GRID) * CELL;
+                        let cy = (slot / GRID) * CELL;
+                        for y in 0..CELL {
+                            for x in 0..CELL {
+                                let p = small.get_pixel(x, y);
+                                let o = (((cy + y) * ATLAS_SIZE + cx + x) * 4) as usize;
+                                atlas[o..o + 4].copy_from_slice(&p.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        mat_slot.insert(mat, slot);
+        slot
+    };
+
     let empty = Vec::new();
     let meshes = glb.json["meshes"].as_array().unwrap_or(&empty).clone();
     for m in &meshes {
@@ -204,33 +283,51 @@ fn append_b3dm(bytes: &[u8], enu: &Enu, tile_seed: u32, mesh: &mut CityMesh) -> 
                 continue;
             };
             let positions = read_vec3(&glb, pos_idx as usize)?;
+            let uvs = prim["attributes"]["TEXCOORD_0"]
+                .as_u64()
+                .and_then(|u| read_vec2(&glb, u as usize).ok());
             let batch = prim["attributes"]["_BATCHID"]
                 .as_u64()
                 .and_then(|b| read_batch_ids(&glb, b as usize).ok());
-            let base = mesh.verts.len() as u32;
-            for (i, p) in positions.iter().enumerate() {
+            let slot = prim["material"]
+                .as_u64()
+                .map(|mt| slot_of(mt as usize, &glb, &mut tile.atlas))
+                .unwrap_or(0);
+            let (cx, cy) = ((slot % GRID * CELL) as f32, (slot / GRID * CELL) as f32);
+
+            // Primitives share big position/uv accessors; expand only the
+            // vertices this primitive's indices actually reference.
+            let prim_indices: Vec<u32> = match prim["indices"].as_u64() {
+                Some(ii) => read_indices(&glb, ii as usize)?,
+                None => (0..positions.len() as u32).collect(),
+            };
+            for idx in prim_indices {
+                let i = idx as usize;
+                if i >= positions.len() {
+                    continue;
+                }
+                let p = positions[i];
                 // 3D Tiles: glTF payloads are y-up, tileset space is z-up ECEF.
                 let ecef = rtc + DVec3::new(p[0] as f64, -(p[2] as f64), p[1] as f64);
                 let w = enu.to_world(ecef);
                 let bid = batch.as_ref().map(|b| b[i] as u32).unwrap_or(0);
-                mesh.verts
-                    .push([w[0], w[1], w[2], hash01(bid ^ tile_seed.rotate_left(9))]);
-            }
-            match prim["indices"].as_u64() {
-                Some(ii) => {
-                    for i in read_indices(&glb, ii as usize)? {
-                        mesh.indices.push(base + i);
-                    }
-                }
-                None => {
-                    for i in 0..positions.len() as u32 {
-                        mesh.indices.push(base + i);
-                    }
-                }
+                let uv = uvs.as_ref().map(|u| u[i]).unwrap_or([0.5, 0.5]);
+                let au = (cx + 0.5 + uv[0].clamp(0.0, 1.0) * (CELL - 1) as f32) / ATLAS_SIZE as f32;
+                let av = (cy + 0.5 + uv[1].clamp(0.0, 1.0) * (CELL - 1) as f32) / ATLAS_SIZE as f32;
+                tile.indices.push(tile.verts.len() as u32);
+                tile.verts.push([
+                    w[0],
+                    w[1],
+                    w[2],
+                    au,
+                    av,
+                    hash01(bid ^ tile_seed.rotate_left(9)),
+                ]);
             }
         }
     }
-    Ok(())
+    anyhow::ensure!(!tile.verts.is_empty(), "empty tile");
+    Ok(tile)
 }
 
 // ---- tileset traversal + download ----
@@ -290,52 +387,60 @@ pub fn load_city() -> anyhow::Result<CityMesh> {
 
     let base = TILESET_URL.rsplit_once('/').map(|(b, _)| b).unwrap_or("");
     let enu = Enu::new(SITE_LAT, SITE_LON);
-    let mut mesh = CityMesh {
-        verts: Vec::new(),
-        indices: Vec::new(),
-        label: String::new(),
-    };
-    let mut failed = 0usize;
-    for (i, (_, uri)) in wanted.iter().enumerate() {
-        let url = format!("{base}/{uri}");
-        let name = uri.replace('/', "_");
-        match cached_get(&url, &name) {
-            Ok(bytes) => {
-                if let Err(e) = append_b3dm(&bytes, &enu, i as u32 + 1, &mut mesh) {
-                    log::warn!("plateau: {uri}: {e:#}");
-                    failed += 1;
+
+    use rayon::prelude::*;
+    let tiles: Vec<CityTile> = wanted
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, (_, uri))| {
+            let url = format!("{base}/{uri}");
+            let name = format!("tex_{}", uri.replace('/', "_"));
+            match cached_get(&url, &name) {
+                Ok(bytes) => match parse_tile(&bytes, &enu, i as u32 + 1) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        log::warn!("plateau: {uri}: {e:#}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::warn!("plateau: fetch {uri}: {e:#}");
+                    None
                 }
             }
-            Err(e) => {
-                log::warn!("plateau: fetch {uri}: {e:#}");
-                failed += 1;
-            }
-        }
-    }
-    anyhow::ensure!(!mesh.verts.is_empty(), "no city geometry loaded");
+        })
+        .collect();
+    anyhow::ensure!(!tiles.is_empty(), "no city geometry loaded");
 
-    // Ground calibration: put the 3rd-percentile height at y = 0.
-    let mut ys: Vec<f32> = mesh.verts.iter().map(|v| v[1]).collect();
+    // Ground calibration across all tiles: 3rd percentile height -> y = 0.
+    let mut mesh = CityMesh {
+        tiles,
+        label: String::new(),
+    };
+    let mut ys: Vec<f32> = mesh
+        .tiles
+        .iter()
+        .flat_map(|t| t.verts.iter().map(|v| v[1]))
+        .collect();
     ys.sort_by(f32::total_cmp);
     let ground = ys[ys.len() / 33];
-    for v in &mut mesh.verts {
-        v[1] -= ground;
+    let mut tris = 0usize;
+    for t in &mut mesh.tiles {
+        for v in &mut t.verts {
+            v[1] -= ground;
+        }
+        tris += t.indices.len() / 3;
     }
 
     mesh.label = format!(
-        "PLATEAU 千代田区 LOD1 · {} tiles · {}k tris{}",
-        wanted.len() - failed,
-        mesh.indices.len() / 3000,
-        if failed > 0 {
-            format!(" ({failed} failed)")
-        } else {
-            String::new()
-        }
+        "PLATEAU 千代田区 (photo tex) · {} tiles · {}k tris",
+        mesh.tiles.len(),
+        tris / 1000,
     );
     log::info!(
-        "plateau: {} verts, {} tris (ground offset {ground:.1} m)",
-        mesh.verts.len(),
-        mesh.indices.len() / 3
+        "plateau: {} tiles, {} tris (ground offset {ground:.1} m)",
+        mesh.tiles.len(),
+        tris
     );
     Ok(mesh)
 }

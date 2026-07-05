@@ -179,8 +179,14 @@ impl Scene {
         }
     }
 
-    pub fn upload_city(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
-        self.tokyo.upload_city(device, verts, indices);
+    pub fn upload_city(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tiles: &[crate::data::plateau::CityTile],
+    ) {
+        self.tokyo
+            .upload_city(device, queue, &self.clamp_samp, tiles);
     }
 
     pub fn upload_rain(

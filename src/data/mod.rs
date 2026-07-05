@@ -80,8 +80,7 @@ pub enum DataMsg {
         label: String,
     },
     CityMesh {
-        verts: Vec<[f32; 4]>,
-        indices: Vec<u32>,
+        tiles: Vec<plateau::CityTile>,
         label: String,
     },
     Rain {
@@ -129,8 +128,7 @@ pub fn spawn_city(tx: Sender<DataMsg>) {
         .spawn(move || match plateau::load_city() {
             Ok(mesh) => {
                 let _ = tx.send(DataMsg::CityMesh {
-                    verts: mesh.verts,
-                    indices: mesh.indices,
+                    tiles: mesh.tiles,
                     label: mesh.label,
                 });
             }

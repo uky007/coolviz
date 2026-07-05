@@ -154,5 +154,5 @@ fn vs_rain(@builtin(vertex_index) vi: u32) -> RainOut {
 
 @fragment
 fn fs_rain(in: RainOut) -> @location(0) vec4<f32> {
-    return vec4(vec3(0.45, 0.62, 0.80) * 0.055 * in.alpha, 1.0);
+    return vec4(vec3(0.45, 0.62, 0.80) * 0.042 * in.alpha, 1.0);
 }

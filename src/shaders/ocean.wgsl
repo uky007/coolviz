@@ -1,7 +1,7 @@
-// OKINAWA SEA: fully procedural physically-inspired reef lagoon.
-// Raymarched terrain (island / lagoon / reef crest / drop-off) under a water
-// plane with depth absorption (emerald -> cobalt), caustics, breaking foam,
-// tropical cumulus. Local frame: meters, x east, y up, z south.
+// OKINAWA SEA v2: procedural reef lagoon with displaced swell.
+// Radially inbound waves shoal and break on the reef crest and beach,
+// interference-pattern caustics, sun-glitter lane, Beer-Lambert water color.
+// Local frame: meters, x east, y up, z south. Everything is analytic.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -18,6 +18,7 @@ struct Globals {
 
 const SUN: vec3<f32> = vec3(-0.42, 0.72, -0.55);
 const ISLAND: vec2<f32> = vec2(-330.0, -400.0);
+const REEF_R: f32 = 940.0;
 
 fn hash21(p: vec2<f32>) -> f32 {
     var q = fract(p * vec2(123.34, 456.21));
@@ -48,108 +49,146 @@ fn fbm(p: vec2<f32>) -> f32 {
     return v;
 }
 
-fn coral_mask(xz: vec2<f32>) -> f32 {
-    return smoothstep(0.56, 0.72, vnoise(xz * 0.055 + 31.7));
+// Irregular shoreline radius.
+fn shore_r(xz: vec2<f32>) -> f32 {
+    return length(xz - ISLAND) + (fbm(xz * 0.004) - 0.5) * 70.0;
 }
 
-/// Seafloor / island height in meters (0 = mean sea level).
-fn terrain(xz: vec2<f32>) -> f32 {
-    let r = length(xz - ISLAND);
-    let wob = (fbm(xz * 0.004) - 0.5) * 90.0; // irregular coastline
-    let rr = r + wob;
+fn coral_mask(xz: vec2<f32>) -> f32 {
+    let n = vnoise(xz * 0.05 + 31.7) * 0.65 + vnoise(xz * 0.15 + 7.1) * 0.35;
+    return smoothstep(0.58, 0.66, n);
+}
 
-    // Island body and beach.
+/// Seafloor / island height (no waves), meters relative to sea level.
+fn terrain(xz: vec2<f32>) -> f32 {
+    let rr = shore_r(xz);
     var h = 30.0 * smoothstep(430.0, 60.0, rr) + (430.0 - rr) * 0.045
         + 4.0 * (fbm(xz * 0.02) - 0.5) * smoothstep(400.0, 200.0, rr);
     h = min(h, 34.0);
-    // Lagoon floor: gently deepening sand.
-    let lagoon = -1.1 - 2.2 * smoothstep(430.0, 900.0, rr);
+    let lagoon = -1.0 - 2.4 * smoothstep(430.0, 900.0, rr);
     h = min(h, max(lagoon, (430.0 - rr) * 0.045));
-    // Coral heads rise from the lagoon.
-    let coral = coral_mask(xz) * smoothstep(520.0, 620.0, rr) * smoothstep(980.0, 860.0, rr);
-    h += coral * 1.7;
-    // Reef crest, then the drop-off.
-    h += 2.6 * exp(-pow((rr - 940.0) / 55.0, 2.0));
-    h -= 42.0 * smoothstep(960.0, 1250.0, rr);
-    // Sand ripples.
-    h += 0.06 * sin(xz.x * 0.9 + xz.y * 0.6) * smoothstep(0.0, -0.5, h);
+    let coral = coral_mask(xz) * smoothstep(500.0, 590.0, rr) * smoothstep(980.0, 880.0, rr);
+    h += coral * (1.4 + 0.6 * vnoise(xz * 0.3));
+    h += 2.4 * exp(-pow((rr - REEF_R) / 55.0, 2.0));
+    h -= 44.0 * smoothstep(955.0, 1250.0, rr);
+    h += 0.05 * sin(xz.x * 0.8 + xz.y * 0.55) * smoothstep(0.0, -0.5, h);
     return h;
 }
 
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    let e = 1.4;
+    let e = 1.2;
     let dx = terrain(xz + vec2(e, 0.0)) - terrain(xz - vec2(e, 0.0));
     let dz = terrain(xz + vec2(0.0, e)) - terrain(xz - vec2(0.0, e));
     return normalize(vec3(-dx, 2.0 * e, -dz));
 }
 
+/// Cheap analytic depth (no fbm) for wave shoaling.
+fn depth_apx(rr: f32) -> f32 {
+    var d = 1.0 + 2.4 * smoothstep(430.0, 900.0, rr); // lagoon
+    d = max(d - 2.4 * exp(-pow((rr - REEF_R) / 55.0, 2.0)), 0.15); // reef crest
+    d += 44.0 * smoothstep(955.0, 1250.0, rr); // drop-off
+    d = min(d, max((rr - 430.0) * 0.045, 0.02)); // beach approach
+    return max(d, 0.02);
+}
+
+const SWELL_K: f32 = 0.17; // ~37 m wavelength
+const SWELL_W: f32 = 1.15;
+
+fn swell_phase(rr: f32, t: f32) -> f32 {
+    return rr * SWELL_K + t * SWELL_W; // crests travel toward the island
+}
+
+/// Displaced water surface height; detail fades with view distance
+/// so the radial swell doesn't alias into rings.
+fn wave_h(xz: vec2<f32>, t: f32, dist: f32) -> f32 {
+    let rr = length(xz - ISLAND);
+    let d = depth_apx(rr);
+    let lod = 1.0 / (1.0 + dist * 0.0016);
+    // Shoaling: swell grows over the reef and near the beach, dies on dry land.
+    let amp = 0.16 * clamp(1.0 / (0.45 + d * 0.35), 0.7, 2.6)
+        * smoothstep(-0.15, 0.8, d)
+        * lod;
+    let ph = swell_phase(rr, t);
+    var h = amp * (sin(ph) + 0.42 * sin(2.0 * ph + 1.3)); // sharpened crests
+    h += 0.045 * sin(dot(xz, vec2(0.055, 0.078)) + t * 0.8) * lod; // cross swell
+    h += (vnoise(xz * 0.30 + vec2(t * 0.20, -t * 0.13)) - 0.5) * 0.10 * lod; // chop
+    return h;
+}
+
+fn water_normal(xz: vec2<f32>, t: f32, dist: f32) -> vec3<f32> {
+    let e = 0.55;
+    let dx = wave_h(xz + vec2(e, 0.0), t, dist) - wave_h(xz - vec2(e, 0.0), t, dist);
+    let dz = wave_h(xz + vec2(0.0, e), t, dist) - wave_h(xz - vec2(0.0, e), t, dist);
+    var n = vec3(-dx, 2.0 * e, -dz);
+    // Capillary shimmer, fading with distance to avoid moire.
+    let cap = 0.35 / (1.0 + dist * 0.02);
+    n.x += (vnoise(xz * 1.9 + vec2(t * 1.1, t * 0.4)) - 0.5) * cap;
+    n.z += (vnoise(xz * 1.9 + vec2(-t * 0.6, t * 0.9) + 13.1) - 0.5) * cap;
+    return normalize(n);
+}
+
+/// Interfering-wavefront caustic filaments.
+fn caustics(p: vec2<f32>, t: f32) -> f32 {
+    let a = sin(p.x * 1.6 + sin(p.y * 1.25 + t * 1.15) * 1.8 + t * 0.62);
+    let b = sin(p.y * 1.8 + sin(p.x * 1.05 - t * 0.95) * 1.9 - t * 0.85);
+    let c = sin((p.x + p.y) * 1.15 + sin((p.x - p.y) * 1.45 + t * 0.75) * 1.6);
+    let v = abs(a + b + c);
+    return pow(clamp(1.0 - v * 0.42, 0.0, 1.0), 3.0);
+}
+
 fn sky(rd: vec3<f32>, t: f32) -> vec3<f32> {
     let sun = normalize(SUN);
     let up = clamp(rd.y, 0.0, 1.0);
-    var col = mix(vec3(0.55, 0.74, 0.95), vec3(0.11, 0.40, 0.92), pow(up, 0.60));
+    var col = mix(vec3(0.55, 0.74, 0.94), vec3(0.075, 0.34, 0.88), pow(up, 0.55));
+    // Thin bright haze right at the horizon.
+    col += vec3(0.30, 0.32, 0.33) * exp(-abs(rd.y) * 14.0) * 0.55;
     let sd = clamp(dot(rd, sun), 0.0, 1.0);
-    col += vec3(1.0, 0.92, 0.75) * (pow(sd, 900.0) * 12.0 + pow(sd, 8.0) * 0.16);
+    col += vec3(1.0, 0.93, 0.78) * (pow(sd, 1100.0) * 14.0 + pow(sd, 10.0) * 0.14);
 
-    if rd.y > 0.02 {
-        let p = rd.xz / (rd.y + 0.18) * 1.1 + vec2(t * 0.004, t * 0.0016);
-        var v = 0.0;
-        var a = 0.5;
-        var q = p;
-        for (var i = 0; i < 5; i++) {
-            v += a * vnoise(q);
-            q = q * 2.04 + vec2(3.1, 7.7);
-            a *= 0.52;
-        }
-        let cl = smoothstep(0.55, 0.78, v);
-        let shade = mix(0.66, 0.95, smoothstep(0.78, 0.95, v));
-        col = mix(col, vec3(0.92, 0.93, 0.95) * shade, cl * smoothstep(0.0, 0.15, rd.y));
+    if rd.y > 0.015 {
+        let p = rd.xz / (rd.y + 0.16);
+        let drift = vec2(t * 0.005, t * 0.002);
+        let d1 = fbm(p * 0.9 + drift);
+        let d2 = fbm(p * 0.9 + drift + vec2(0.05, -0.13));
+        let body = smoothstep(0.56, 0.72, d1);
+        // Flat-bottomed look: tops brighter where the second sample thins.
+        let top = smoothstep(0.0, 0.25, d1 - d2 + 0.06);
+        let cloud_col = mix(vec3(0.72, 0.74, 0.80), vec3(1.06, 1.06, 1.04), top);
+        col = mix(col, cloud_col, body * smoothstep(0.0, 0.12, rd.y) * 0.96);
     }
     return col;
 }
 
-fn wave_normal(xz: vec2<f32>, t: f32, depth_hint: f32, dist: f32) -> vec3<f32> {
-    // Swell steepens over the shallows; detail fades with distance (anti-moire).
-    let fade = 1.0 / (1.0 + dist * 0.014);
-    let amp = (0.028 + 0.10 * exp(-max(depth_hint, 0.0) * 0.35)) * fade;
-    var n = vec3(0.0, 1.0, 0.0);
-    let d1 = normalize(vec2(0.8, 0.6));
-    let d2 = normalize(vec2(-0.5, 0.8));
-    let d3 = normalize(vec2(0.2, -0.9));
-    n.x -= amp * 5.2 * cos(dot(xz, d1) * 0.34 - t * 1.7) * d1.x * 0.34;
-    n.z -= amp * 5.2 * cos(dot(xz, d1) * 0.34 - t * 1.7) * d1.y * 0.34;
-    n.x -= amp * 3.4 * cos(dot(xz, d2) * 0.83 - t * 2.6) * d2.x * 0.83;
-    n.z -= amp * 3.4 * cos(dot(xz, d2) * 0.83 - t * 2.6) * d2.y * 0.83;
-    n.x -= amp * 1.6 * cos(dot(xz, d3) * 2.9 - t * 3.9) * d3.x * 0.35;
-    n.z -= amp * 1.6 * cos(dot(xz, d3) * 2.9 - t * 3.9) * d3.y * 0.35;
-    // Fine capillary shimmer.
-    let cap = 0.05 * fade;
-    n.x += (vnoise(xz * 1.4 + t * 0.9) - 0.5) * cap;
-    n.z += (vnoise(xz * 1.4 - t * 0.7 + 13.1) - 0.5) * cap;
-    return normalize(n);
-}
-
 fn seabed_albedo(xz: vec2<f32>) -> vec3<f32> {
-    var alb = vec3(0.93, 0.88, 0.74); // coral sand
-    alb *= 0.92 + 0.08 * sin(xz.x * 0.9 + xz.y * 0.6);
+    var alb = vec3(1.00, 0.95, 0.80); // bright coral sand
+    alb *= 0.93 + 0.07 * sin(xz.x * 0.8 + xz.y * 0.55);
+    alb *= 0.95 + 0.05 * vnoise(xz * 0.9);
     let cm = coral_mask(xz);
-    let coral_col = mix(vec3(0.16, 0.30, 0.26), vec3(0.38, 0.26, 0.30), vnoise(xz * 0.4));
-    alb = mix(alb, coral_col, cm * 0.85);
-    // Seagrass flecks.
-    alb = mix(alb, vec3(0.20, 0.38, 0.28), smoothstep(0.75, 0.9, vnoise(xz * 0.13 + 71.0)) * 0.5);
+    let coral_col = mix(
+        vec3(0.13, 0.26, 0.20),
+        vec3(0.32, 0.21, 0.24),
+        vnoise(xz * 0.35),
+    );
+    alb = mix(alb, coral_col, cm * 0.9);
+    alb = mix(
+        alb,
+        vec3(0.16, 0.34, 0.24),
+        smoothstep(0.78, 0.92, vnoise(xz * 0.11 + 71.0)) * 0.45,
+    );
     return alb;
 }
 
 fn march_terrain(ro: vec3<f32>, rd: vec3<f32>, t_max: f32) -> f32 {
     var t = 1.0;
     var th = 0.05;
-    for (var i = 0; i < 80; i++) {
+    for (var i = 0; i < 90; i++) {
         let p = ro + rd * t;
         let dh = p.y - terrain(p.xz);
         if dh < th {
             return t;
         }
-        t += max(dh * 0.55, 0.35);
-        th = 0.05 + t * 0.002;
+        t += max(dh * 0.5, 0.3);
+        th = 0.05 + t * 0.0022;
         if t > t_max {
             break;
         }
@@ -157,17 +196,25 @@ fn march_terrain(ro: vec3<f32>, rd: vec3<f32>, t_max: f32) -> f32 {
     return -1.0;
 }
 
-fn shade_land(p: vec3<f32>, rd: vec3<f32>, t: f32) -> vec3<f32> {
+fn shade_land(p: vec3<f32>, t: f32) -> vec3<f32> {
     let n = terrain_normal(p.xz);
     let sun = normalize(SUN);
-    var alb = vec3(0.84, 0.78, 0.63); // dry coral sand
-    let veg = smoothstep(1.5, 4.5, p.y) * smoothstep(0.32, 0.55, vnoise(p.xz * 0.05 + 5.0));
-    alb = mix(alb, vec3(0.09, 0.30, 0.13) * (0.8 + 0.4 * vnoise(p.xz * 0.3)), veg);
-    // Wet sand at the waterline.
-    alb *= 1.0 - 0.35 * smoothstep(0.8, 0.05, p.y);
+    // Warm dry sand with fine grain; damp band at the waterline.
+    var alb = vec3(0.97, 0.89, 0.70);
+    alb *= 0.92 + 0.16 * vnoise(p.xz * 1.3);
+    alb *= 0.97 + 0.03 * vnoise(p.xz * 7.0);
+    let veg = smoothstep(2.2, 5.5, p.y)
+        * smoothstep(0.34, 0.56, vnoise(p.xz * 0.03 + 5.0));
+    let veg_col = mix(vec3(0.05, 0.20, 0.08), vec3(0.11, 0.34, 0.12), vnoise(p.xz * 0.6));
+    alb = mix(alb, veg_col, veg);
+    let wet = smoothstep(0.9, 0.1, p.y);
+    alb *= 1.0 - 0.38 * wet;
     let dif = clamp(dot(n, sun), 0.0, 1.0);
-    let amb = 0.35 + 0.2 * n.y;
-    return alb * (dif * vec3(1.0, 0.96, 0.88) * 0.95 + amb * vec3(0.5, 0.65, 0.85));
+    let amb = 0.30 + 0.22 * n.y;
+    var col = alb * (dif * vec3(1.05, 1.00, 0.90) + amb * vec3(0.42, 0.58, 0.85));
+    // Glistening wet sand.
+    col += vec3(0.5) * wet * pow(clamp(dot(reflect(-sun, n), vec3(0.0, 1.0, 0.0)), 0.0, 1.0), 24.0) * 0.15;
+    return col;
 }
 
 struct FullOut {
@@ -192,84 +239,97 @@ fn fs_main(in: FullOut) -> @location(0) vec4<f32> {
 
     var col = sky(rd, t);
 
-    // Distance to the water plane (y = 0).
+    // Displaced water-surface intersection (relaxed Newton on the plane hit).
     var t_water = 1e9;
     if rd.y < -1e-4 {
-        t_water = -ro.y / rd.y;
+        var tw = -ro.y / rd.y;
+        for (var i = 0; i < 4; i++) {
+            let p = ro + rd * tw;
+            tw += (wave_h(p.xz, t, tw) - p.y) / rd.y;
+        }
+        t_water = max(tw, 0.0);
     }
-    let t_land = march_terrain(ro, rd, min(t_water, 6000.0));
+    let t_land = march_terrain(ro, rd, min(t_water + 30.0, 6000.0));
 
-    if t_land > 0.0 {
-        // Dry land before the water line.
+    if t_land > 0.0 && t_land < t_water {
         let p = ro + rd * t_land;
-        col = shade_land(p, rd, t);
-        col = mix(col, sky(rd, t), smoothstep(1800.0, 5200.0, t_land) * 0.7);
+        col = shade_land(p, t);
+        col = mix(col, sky(rd, t), smoothstep(1800.0, 5200.0, t_land) * 0.65);
     } else if t_water < 6000.0 {
-        let sp = ro + rd * t_water; // surface point
-        let depth_here = -terrain(sp.xz);
-        let n = wave_normal(sp.xz, t, depth_here, t_water);
+        let sp = ro + rd * t_water;
+        let rr = length(sp.xz - ISLAND);
+        let depth_here = max(-terrain(sp.xz), 0.0);
+        let n = water_normal(sp.xz, t, t_water);
 
-        // Refracted ray into the water.
+        // ---- refracted bottom color ----
         let refr = refract(rd, n, 0.752);
-        var wcol = vec3(0.0, 0.10, 0.12);
-        var wlen = 30.0;
+        var wcol = vec3(0.0, 0.09, 0.13);
         if length(refr) > 0.0 {
             var tt = 0.4;
-            var hit = sp + refr * tt;
-            for (var i = 0; i < 28; i++) {
+            var hit = sp;
+            for (var i = 0; i < 26; i++) {
                 hit = sp + refr * tt;
                 let dh = hit.y - terrain(hit.xz);
-                if dh < 0.05 {
+                if dh < 0.06 {
                     break;
                 }
                 tt += max(dh * 0.7, 0.25);
-                if tt > 120.0 {
+                if tt > 140.0 {
                     break;
                 }
             }
-            wlen = tt;
-            let depth = max(-hit.y, 0.02);
+            let wlen = tt;
+            let depth = max(-hit.y, 0.03);
             var alb = seabed_albedo(hit.xz);
-            // Caustics dance on the shallow floor.
-            let ca = pow(
-                vnoise(hit.xz * 0.55 + vec2(t * 0.35, -t * 0.22)) *
-                vnoise(hit.xz * 0.47 - vec2(t * 0.27, t * 0.31)),
-                2.0,
-            ) * 2.6 * exp(-depth * 0.30);
-            alb *= 0.85 + ca;
-            // Beer-Lambert absorption: red dies first -> emerald shallows.
-            let absorb = vec3(0.30, 0.058, 0.034);
-            let tr = exp(-wlen * absorb * 0.62);
-            let scatter = vec3(0.008, 0.155, 0.150) * (1.0 - exp(-wlen * 0.115));
-            wcol = alb * tr * (0.50 + 0.55 * clamp(dot(vec3(0.0, 1.0, 0.0), sun), 0.0, 1.0)) + scatter;
+            let patchy = 0.45 + 0.9 * vnoise(hit.xz * 0.028 + vec2(t * 0.015, 0.0));
+            let ca = caustics(hit.xz * 0.5, t) * 2.2 * exp(-depth * 0.24) * patchy;
+            alb *= 0.84 + ca;
+            // Absorption: red first -> fluorescent emerald over sand.
+            let tr = exp(-wlen * vec3(0.215, 0.032, 0.016));
+            let scatter_col = mix(
+                vec3(0.03, 0.62, 0.56),
+                vec3(0.0, 0.145, 0.38),
+                1.0 - exp(-depth * 0.11),
+            );
+            let scatter = scatter_col * (1.0 - exp(-wlen * 0.14));
+            wcol = alb * tr * 0.98 + scatter;
         }
 
-        // Fresnel blend with the sky reflection.
+        // ---- reflection + fresnel ----
         let f0 = 0.021;
         let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(-rd, n), 0.0, 1.0), 5.0);
         let rdir = reflect(rd, n);
-        var rcol = sky(vec3(rdir.x, abs(rdir.y) * 0.9 + 0.02, rdir.z), t);
+        let rcol = sky(vec3(rdir.x, abs(rdir.y) * 0.92 + 0.02, rdir.z), t);
         col = mix(wcol, rcol, clamp(fres, 0.0, 1.0));
 
-        // Sun glitter.
-        col += vec3(1.0, 0.95, 0.85) * pow(clamp(dot(rdir, sun), 0.0, 1.0), 750.0) * 2.0;
+        // ---- sun glitter lane (near-field only) ----
+        let sun_align = clamp(dot(rdir, sun), 0.0, 1.0);
+        let near = smoothstep(2400.0, 600.0, t_water);
+        let sparkle = step(0.845, vnoise(sp.xz * 4.2 + vec2(t * 1.9, -t * 1.4)));
+        col += vec3(1.0, 0.97, 0.90)
+            * (pow(sun_align, 950.0) * 2.4 + pow(sun_align, 55.0) * sparkle * 1.15 * near);
 
-        // Breaking foam on the reef crest and the beach lap.
-        let rr = length(sp.xz - ISLAND) + (fbm(sp.xz * 0.004) - 0.5) * 90.0;
-        let crest = exp(-pow((rr - 940.0) / 46.0, 2.0));
-        let surge = 0.5 + 0.5 * sin(rr * 0.16 - t * 1.9 + vnoise(sp.xz * 0.05) * 3.0);
-        var foam = crest * smoothstep(0.35, 0.9, surge) * 0.9;
-        foam += smoothstep(0.55, 0.1, depth_here) *
-            (0.35 + 0.4 * sin(rr * 0.7 - t * 2.4)) * 0.45;
-        foam *= smoothstep(0.0, 0.35, depth_here + 0.3);
-        let foam_tex = 0.75 + 0.25 * vnoise(sp.xz * 1.1 + t * 0.5);
-        col = mix(col, vec3(0.98, 1.0, 1.0) * foam_tex, clamp(foam, 0.0, 0.85));
+        // ---- breaking foam ----
+        let ph = swell_phase(rr, t);
+        let crest = 0.5 + 0.5 * sin(ph + 0.7);
+        let shallow = exp(-depth_here * 0.85);
+        // White arcs that ride the crests over the reef and up the beach.
+        var foam = smoothstep(0.52, 0.94, crest) * smoothstep(0.30, 0.95, shallow * 1.5);
+        // Permanent boil on the reef crest ring.
+        foam += exp(-pow((rr - REEF_R) / 42.0, 2.0))
+            * (0.45 + 0.55 * vnoise(sp.xz * 0.35 + vec2(t * 0.5, 0.0)));
+        // Trailing wash behind each crest.
+        foam += smoothstep(0.52, 0.94, 0.5 + 0.5 * sin(ph - 0.9)) * shallow * 0.35;
+        let mottle = vnoise(sp.xz * 1.05 + vec2(t * 0.32, -t * 0.21)) * 0.6
+            + vnoise(sp.xz * 3.1 + vec2(-t * 0.18, t * 0.26)) * 0.4;
+        foam *= smoothstep(0.22, 0.7, mottle + foam * 0.35);
+        foam *= smoothstep(-0.05, 0.3, depth_here + 0.15); // none on dry sand
+        col = mix(col, vec3(0.99, 1.0, 1.01) * (0.85 + 0.15 * mottle), clamp(foam, 0.0, 0.92));
 
-        // Aerial perspective over long water distances.
-        col = mix(col, sky(rd, t) * 0.98, smoothstep(1200.0, 5200.0, t_water) * 0.5);
+        // Aerial perspective.
+        col = mix(col, sky(rd, t) * 0.98, smoothstep(1300.0, 5200.0, t_water) * 0.35);
     }
 
-    // Scene gain: keep mid-tones below the bloom range so only the sun,
-    // glitter and foam actually glow.
+    // Keep mid-tones under the bloom threshold; sun, glitter and foam glow.
     return vec4(col * 0.56, 1.0);
 }

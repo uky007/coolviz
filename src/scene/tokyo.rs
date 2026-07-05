@@ -53,14 +53,23 @@ fn texture_ty() -> wgpu::BindingType {
     }
 }
 
+struct CityTileGpu {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    n_indices: u32,
+    atlas_bg: wgpu::BindGroup,
+    _atlas: wgpu::Texture,
+}
+
 pub struct TokyoPass {
     // City surfaces.
     city_bgl: wgpu::BindGroupLayout,
     city_bg: wgpu::BindGroup,
+    atlas_bgl: wgpu::BindGroupLayout,
     sky_pl: wgpu::RenderPipeline,
     ground_pl: wgpu::RenderPipeline,
     bldg_pl: wgpu::RenderPipeline,
-    bldg: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    bldg: Vec<CityTileGpu>,
     pub city_loaded: bool,
     // Rain.
     rainmap_buf: wgpu::Buffer,
@@ -236,22 +245,75 @@ impl TokyoPass {
             &[],
             wgpu::CompareFunction::LessEqual,
         );
-        let bldg_layout = wgpu::VertexBufferLayout {
-            array_stride: 16,
+
+        // Buildings carry a facade-photo atlas in bind group 1.
+        let atlas_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("atlas"),
+            entries: &[
+                entry(0, texture_ty()),
+                entry(
+                    1,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+            ],
+        });
+        let bldg_layout_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bldg"),
+            bind_group_layouts: &[Some(&city_bgl), Some(&atlas_bgl)],
+            immediate_size: 0,
+        });
+        let bldg_vlayout = wgpu::VertexBufferLayout {
+            array_stride: 24,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute {
-                format: wgpu::VertexFormat::Float32x4,
-                offset: 0,
-                shader_location: 0,
-            }],
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 12,
+                    shader_location: 1,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 20,
+                    shader_location: 2,
+                },
+            ],
         };
-        let bldg_pl = mk_city_pl(
-            "tokyo-bldg",
-            "vs_bldg",
-            "fs_bldg",
-            std::slice::from_ref(&bldg_layout),
-            wgpu::CompareFunction::LessEqual,
-        );
+        let bldg_pl = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tokyo-bldg"),
+            layout: Some(&bldg_layout_pl),
+            vertex: wgpu::VertexState {
+                module: &city_shader,
+                entry_point: Some("vs_bldg"),
+                compilation_options: Default::default(),
+                buffers: std::slice::from_ref(&bldg_vlayout),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &city_shader,
+                entry_point: Some("fs_bldg"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         // ---- rain sim ----
         let sim_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -380,10 +442,11 @@ impl TokyoPass {
         Self {
             city_bgl,
             city_bg,
+            atlas_bgl,
             sky_pl,
             ground_pl,
             bldg_pl,
-            bldg: None,
+            bldg: Vec::new(),
             city_loaded: false,
             rainmap_buf,
             rainsim_buf,
@@ -400,19 +463,85 @@ impl TokyoPass {
         }
     }
 
-    pub fn upload_city(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bldg-verts"),
-            contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bldg-indices"),
-            contents: bytemuck::cast_slice(indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        self.bldg = Some((vbuf, ibuf, indices.len() as u32));
-        self.city_loaded = true;
+    pub fn upload_city(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        clamp_samp: &wgpu::Sampler,
+        tiles: &[crate::data::plateau::CityTile],
+    ) {
+        let asize = crate::data::plateau::ATLAS_SIZE;
+        self.bldg = tiles
+            .iter()
+            .map(|t| {
+                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("bldg-verts"),
+                    contents: bytemuck::cast_slice(&t.verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("bldg-indices"),
+                    contents: bytemuck::cast_slice(&t.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let atlas = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("facade-atlas"),
+                    size: wgpu::Extent3d {
+                        width: asize,
+                        height: asize,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &atlas,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &t.atlas,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(asize * 4),
+                        rows_per_image: Some(asize),
+                    },
+                    wgpu::Extent3d {
+                        width: asize,
+                        height: asize,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                let view = atlas.create_view(&wgpu::TextureViewDescriptor::default());
+                let atlas_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("atlas"),
+                    layout: &self.atlas_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(clamp_samp),
+                        },
+                    ],
+                });
+                CityTileGpu {
+                    vbuf,
+                    ibuf,
+                    n_indices: t.indices.len() as u32,
+                    atlas_bg,
+                    _atlas: atlas,
+                }
+            })
+            .collect();
+        self.city_loaded = !self.bldg.is_empty();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -561,11 +690,14 @@ impl TokyoPass {
         rp.draw(0..3, 0..1);
         rp.set_pipeline(&self.ground_pl);
         rp.draw(0..6, 0..1);
-        if let Some((vbuf, ibuf, n)) = &self.bldg {
+        if !self.bldg.is_empty() {
             rp.set_pipeline(&self.bldg_pl);
-            rp.set_vertex_buffer(0, vbuf.slice(..));
-            rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rp.draw_indexed(0..*n, 0, 0..1);
+            for tile in &self.bldg {
+                rp.set_bind_group(1, &tile.atlas_bg, &[]);
+                rp.set_vertex_buffer(0, tile.vbuf.slice(..));
+                rp.set_index_buffer(tile.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..tile.n_indices, 0, 0..1);
+            }
         }
         rp.set_pipeline(&self.draw_pl);
         rp.set_bind_group(0, &self.draw_bg, &[]);

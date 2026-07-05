@@ -72,8 +72,8 @@ fn rain_level(xz: vec2<f32>, t: f32) -> f32 {
 }
 
 fn fog_mix(col: vec3<f32>, dist: f32, rain: f32) -> vec3<f32> {
-    let fog_col = vec3(0.016, 0.024, 0.038);
-    let f = 1.0 - exp(-dist * (0.00010 + rain * 0.00016));
+    let fog_col = vec3(0.010, 0.015, 0.026);
+    let f = 1.0 - exp(-dist * (0.00009 + rain * 0.00011));
     return mix(col, fog_col, clamp(f, 0.0, 1.0));
 }
 
@@ -163,17 +163,25 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4<f32> {
     return vec4(fog_mix(col, dist, rain), 1.0);
 }
 
-// ---------------- buildings ----------------
+// ---------------- buildings (PLATEAU photo textures) ----------------
+
+@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
+@group(1) @binding(1) var atlas_samp: sampler;
 
 struct BldgOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) world: vec3<f32>,
-    @location(1) hash: f32,
+    @location(1) uv: vec2<f32>,
+    @location(2) hash: f32,
 };
 
 @vertex
-fn vs_bldg(@location(0) p: vec4<f32>) -> BldgOut {
-    return BldgOut(G.view_proj * vec4(p.xyz, 1.0), p.xyz, p.w);
+fn vs_bldg(
+    @location(0) p: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) hash: f32,
+) -> BldgOut {
+    return BldgOut(G.view_proj * vec4(p, 1.0), p, uv, hash);
 }
 
 @fragment
@@ -185,12 +193,22 @@ fn fs_bldg(in: BldgOut) -> @location(0) vec4<f32> {
 
     let rain = rain_level(in.world.xz, t);
 
-    // Dark monolith body with height gradient.
-    var col = vec3(0.013, 0.017, 0.025) * (0.5 + 0.5 * clamp(in.world.y / 120.0, 0.0, 1.0));
-    // Cool key light from the storm deck.
-    col += vec3(0.030, 0.045, 0.062) * clamp(n.y, 0.0, 1.0) * 0.45;
+    // Facade photo, graded into a rainy dusk: slightly desaturated, cooled.
+    let tex = textureSample(atlas_tex, atlas_samp, in.uv).rgb;
+    let lum = dot(tex, vec3(0.30, 0.59, 0.11));
+    // Contrast curve keeps highlights while crushing mids into the dusk.
+    let base = pow(
+        mix(tex, vec3(lum), 0.22) * vec3(0.72, 0.82, 1.02),
+        vec3(1.4),
+    );
 
-    // Windows on walls.
+    var col = base
+        * (0.060
+            + 0.150 * clamp(n.y, 0.0, 1.0)
+            + 0.080 * clamp(dot(n, normalize(vec3(-0.45, 0.35, -0.60))), 0.0, 1.0)
+            + 0.040 * clamp(in.world.y / 150.0, 0.0, 1.0));
+
+    // Lit windows glow through the dusk facade.
     if abs(n.y) < 0.35 {
         let perp = normalize(vec2(-n.z, n.x));
         let u = dot(in.world.xz, perp) / 3.4;
@@ -198,15 +216,16 @@ fn fs_bldg(in: BldgOut) -> @location(0) vec4<f32> {
         let cell = floor(vec2(u, v));
         let f = fract(vec2(u, v));
         let inside = step(0.18, f.x) * step(f.x, 0.86) * step(0.25, f.y) * step(f.y, 0.80);
-        let on = step(0.80, hash21(cell + vec2(in.hash * 251.0, in.hash * 97.0)));
+        let on = step(0.82, hash21(cell + vec2(in.hash * 251.0, in.hash * 97.0)));
         let flicker = 0.85 + 0.15 * sin(t * 1.3 + hash21(cell) * 40.0);
         let warm = mix(vec3(1.0, 0.72, 0.40), vec3(0.75, 0.85, 1.0), step(0.8, hash21(cell + 7.7)));
-        col += warm * inside * on * flicker * 1.05;
+        // Windows brighten where the photo already has glazing (darker areas).
+        col += warm * inside * on * flicker * (0.55 + 0.8 * (1.0 - lum));
     }
 
     // Cyan rim against the fog.
     let fres = pow(1.0 - clamp(dot(n, view), 0.0, 1.0), 4.0);
-    col += vec3(0.10, 0.30, 0.42) * fres * 0.14;
+    col += vec3(0.10, 0.30, 0.42) * fres * 0.12;
 
     // Wet facades pick up a faint sheen.
     col += vec3(0.03, 0.05, 0.07) * rain * pow(1.0 - abs(n.y), 2.0) * 0.5;

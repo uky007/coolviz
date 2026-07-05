@@ -250,12 +250,8 @@ impl App {
                     self.scene.upload_clouds(&rs.device, &rs.queue, w, h, &rgba);
                     self.status.clouds = Some(label);
                 }
-                DataMsg::CityMesh {
-                    verts,
-                    indices,
-                    label,
-                } => {
-                    self.scene.upload_city(&rs.device, &verts, &indices);
+                DataMsg::CityMesh { tiles, label } => {
+                    self.scene.upload_city(&rs.device, &rs.queue, &tiles);
                     self.status.city = Some(label);
                 }
                 DataMsg::Rain {
@@ -980,7 +976,7 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
     if o.mode == SceneMode::Tokyo {
         let mesh = data::plateau::load_city()?;
         log::info!("shot: {}", mesh.label);
-        scene.upload_city(&device, &mesh.verts, &mesh.indices);
+        scene.upload_city(&device, &queue, &mesh.tiles);
         match data::rain::fetch_once(data::plateau::SITE_LON, data::plateau::SITE_LAT) {
             Ok(g) => {
                 log::info!("shot: rain {} (max lv{})", g.label, g.max_level);
