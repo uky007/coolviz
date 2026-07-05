@@ -120,6 +120,12 @@ struct App {
     fps: f32,
     sat_t0_unix: Option<f64>,
     iss: Option<([f32; 3], [f32; 3])>,
+    // CPU copies for the hover inspector.
+    sat_states: Vec<data::SatGpu>,
+    sat_idxs: Vec<u32>,
+    sat_names: Vec<String>,
+    quake_list: Vec<QuakeCpu>,
+    wind_grid: Option<(u32, u32, Vec<[u16; 2]>)>,
     tex: Option<(egui::TextureId, (u32, u32))>,
     // UI state
     show_wind: bool,
@@ -177,6 +183,11 @@ impl App {
             fps: 60.0,
             sat_t0_unix: None,
             iss: None,
+            sat_states: Vec::new(),
+            sat_idxs: Vec::new(),
+            sat_names: Vec::new(),
+            quake_list: Vec::new(),
+            wind_grid: None,
             tex: None,
             show_wind: true,
             show_sats: true,
@@ -202,11 +213,13 @@ impl App {
                     source,
                 } => {
                     self.scene.upload_wind(&rs.device, &rs.queue, w, h, &data);
+                    self.wind_grid = Some((w, h, data));
                     self.status.wind = Some((source, label));
                 }
                 DataMsg::Sats {
                     t0_unix,
                     states,
+                    idxs,
                     label,
                     source,
                 } => {
@@ -219,14 +232,18 @@ impl App {
                     });
                     self.scene
                         .upload_sats(&rs.device, &rs.queue, bytemuck::cast_slice(&states));
+                    self.sat_states = states;
+                    self.sat_idxs = idxs;
                     self.sat_t0_unix = Some(t0_unix);
                     self.status.sats = Some((source, label, n));
                 }
+                DataMsg::SatNames(names) => self.sat_names = names,
                 DataMsg::Quakes { list, label } => {
                     let packed = pack_quakes(&list, self.app_epoch_unix);
                     let n = packed.len();
                     self.scene
                         .upload_quakes(&rs.device, &rs.queue, bytemuck::cast_slice(&packed));
+                    self.quake_list = list;
                     self.status.quakes = Some((label, n));
                 }
                 DataMsg::Clouds { w, h, rgba, label } => {
@@ -697,6 +714,149 @@ impl eframe::App for App {
                         );
                     }
                 }
+            }
+        }
+
+        // Hover inspector (Earth mode): nearest quake or satellite under the
+        // cursor, else a lat/lon + wind readout on the globe surface.
+        if self.mode == SceneMode::Earth
+            && self.show_hud
+            && let Some(cur) = resp.hover_pos()
+        {
+            let to_screen = |w: glam::Vec3| -> Option<egui::Pos2> {
+                let clip = fi.view_proj * w.extend(1.0);
+                if clip.w <= 0.0 {
+                    return None;
+                }
+                let ndc = clip.truncate() / clip.w;
+                Some(egui::pos2(
+                    rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+                    rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
+                ))
+            };
+            let cam = fi.cam_pos;
+            let occluded = |p: glam::Vec3| -> bool {
+                let to = p - cam;
+                let dist = to.length();
+                let dir = to / dist.max(1e-6);
+                let t_close = -cam.dot(dir);
+                t_close > 0.0 && t_close < dist && (cam + dir * t_close).length() < 0.995
+            };
+            let mut lines: Vec<String> = Vec::new();
+
+            let mut best_sat: Option<usize> = None;
+            let mut best_sat_d2 = 11.0f32 * 11.0;
+            if self.show_sats {
+                for (i, s) in self.sat_states.iter().enumerate() {
+                    let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]])
+                        + glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]) * fi.sat_dt;
+                    if let Some(sp) = to_screen(wp) {
+                        let d2 = sp.distance_sq(cur);
+                        if d2 < best_sat_d2 && !occluded(wp) {
+                            best_sat_d2 = d2;
+                            best_sat = Some(i);
+                        }
+                    }
+                }
+            }
+            let mut best_q: Option<usize> = None;
+            let mut best_q_d2 = 14.0f32 * 14.0;
+            if self.show_quakes {
+                for (i, q) in self.quake_list.iter().enumerate() {
+                    let wp = astro::latlon_to_world(q.lat, q.lon) * 1.004;
+                    if let Some(sp) = to_screen(wp) {
+                        let d2 = sp.distance_sq(cur);
+                        if d2 < best_q_d2 && !occluded(wp) {
+                            best_q_d2 = d2;
+                            best_q = Some(i);
+                        }
+                    }
+                }
+            }
+
+            if let Some(i) = best_q {
+                let q = &self.quake_list[i];
+                let age_h = (astro::unix_seconds(Utc::now()) - q.unix_ms as f64 / 1000.0) / 3600.0;
+                lines.push(format!("M{:.1} · {}", q.mag, q.place));
+                lines.push(format!("{age_h:.1} h ago"));
+            } else if let Some(i) = best_sat {
+                let s = &self.sat_states[i];
+                let name = self
+                    .sat_idxs
+                    .get(i)
+                    .and_then(|&ix| self.sat_names.get(ix as usize))
+                    .cloned()
+                    .unwrap_or_else(|| "satellite".into());
+                let kind = match s.pos[3] as u32 {
+                    0 => "LEO",
+                    1 => "MEO",
+                    2 => "GEO",
+                    3 => "HEO",
+                    _ => "ISS",
+                };
+                let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]]);
+                let alt = (wp.length() - 1.0) * 6371.0;
+                let spd = glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]).length() * 6371.0;
+                lines.push(name);
+                lines.push(format!("{kind} · {alt:.0} km · {spd:.2} km/s"));
+            } else {
+                let ndc = glam::Vec2::new(
+                    (cur.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+                    -((cur.y - rect.min.y) / rect.height() * 2.0 - 1.0),
+                );
+                let pw = fi.inv_view_proj * glam::Vec4::new(ndc.x, ndc.y, 0.6, 1.0);
+                let dir = (pw.truncate() / pw.w - cam).normalize();
+                let b = cam.dot(dir);
+                let c = cam.dot(cam) - 1.0;
+                let h2 = b * b - c;
+                if h2 > 0.0 && -b - h2.sqrt() > 0.0 {
+                    let p = cam + dir * (-b - h2.sqrt());
+                    let lat = p.y.asin().to_degrees();
+                    let lon = (-p.z).atan2(p.x).to_degrees();
+                    lines.push(format!(
+                        "{:.2}°{} {:.2}°{}",
+                        lat.abs(),
+                        if lat >= 0.0 { "N" } else { "S" },
+                        lon.abs(),
+                        if lon >= 0.0 { "E" } else { "W" },
+                    ));
+                    if self.show_wind
+                        && let Some((w, h, grid)) = &self.wind_grid
+                    {
+                        let col =
+                            ((lon.rem_euclid(360.0) / 360.0) * *w as f32) as usize % *w as usize;
+                        let row = (((90.0 - lat) / 180.0) * (*h as f32 - 1.0))
+                            .clamp(0.0, *h as f32 - 1.0) as usize;
+                        let px = grid[row * *w as usize + col];
+                        let u = half::f16::from_bits(px[0]).to_f32();
+                        let v = half::f16::from_bits(px[1]).to_f32();
+                        lines.push(format!("WIND {:.1} m/s", (u * u + v * v).sqrt()));
+                    }
+                }
+            }
+
+            if !lines.is_empty() {
+                let painter = ui.painter();
+                let galley = painter.layout_no_wrap(
+                    lines.join("\n"),
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::from_rgb(205, 235, 250),
+                );
+                let pad = egui::vec2(8.0, 6.0);
+                let pos = cur + egui::vec2(14.0, 12.0);
+                let r = egui::Rect::from_min_size(pos, galley.size() + pad * 2.0);
+                painter.rect_filled(
+                    r,
+                    5.0,
+                    egui::Color32::from_rgba_unmultiplied(5, 12, 20, 225),
+                );
+                painter.rect_stroke(
+                    r,
+                    5.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(26, 62, 86)),
+                    egui::StrokeKind::Outside,
+                );
+                painter.galley(pos + pad, galley, egui::Color32::WHITE);
             }
         }
 

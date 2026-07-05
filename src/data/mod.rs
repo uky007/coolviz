@@ -48,6 +48,7 @@ pub struct QuakeCpu {
     pub lat: f32,
     pub mag: f32,
     pub unix_ms: i64,
+    pub place: String,
 }
 
 pub enum DataMsg {
@@ -61,9 +62,13 @@ pub enum DataMsg {
     Sats {
         t0_unix: f64,
         states: Vec<SatGpu>,
+        /// Catalog-entry index per state (for name lookup on hover).
+        idxs: Vec<u32>,
         label: String,
         source: Source,
     },
+    /// Satellite names aligned with catalog-entry indices; sent once per catalog (re)load.
+    SatNames(Vec<String>),
     Quakes {
         list: Vec<QuakeCpu>,
         label: String,

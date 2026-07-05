@@ -29,6 +29,10 @@ pub fn fetch_once() -> anyhow::Result<(Vec<QuakeCpu>, String)> {
             lat: lat as f32,
             mag: mag as f32,
             unix_ms: time,
+            place: f["properties"]["place"]
+                .as_str()
+                .unwrap_or("unknown location")
+                .to_string(),
         };
         max_mag = max_mag.max(q.mag);
         list.push(q);

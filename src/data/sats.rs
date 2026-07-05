@@ -24,6 +24,7 @@ struct Entry {
 
 pub struct SatSet {
     entries: Vec<Entry>,
+    pub names: Vec<String>,
     pub label: String,
     pub source: Source,
 }
@@ -121,18 +122,25 @@ pub fn build_set(prefer_offline: bool) -> SatSet {
         }
     };
     let total = elements.len();
-    let entries: Vec<Entry> = elements
+    let (entries, names): (Vec<Entry>, Vec<String>) = elements
         .par_iter()
         .filter_map(|el| {
             let constants = sgp4::Constants::from_elements(el).ok()?;
-            Some(Entry {
-                constants,
-                epoch: el.datetime,
-                kind: classify(el),
-                bright: 0.55 + 0.65 * hash01(el.norad_id),
-            })
+            let name = el
+                .object_name
+                .clone()
+                .unwrap_or_else(|| format!("NORAD {}", el.norad_id));
+            Some((
+                Entry {
+                    constants,
+                    epoch: el.datetime,
+                    kind: classify(el),
+                    bright: 0.55 + 0.65 * hash01(el.norad_id),
+                },
+                name,
+            ))
         })
-        .collect();
+        .unzip();
     let label = format!("{} objects", entries.len());
     log::info!(
         "satellites: {} usable of {} ({})",
@@ -142,17 +150,19 @@ pub fn build_set(prefer_offline: bool) -> SatSet {
     );
     SatSet {
         entries,
+        names,
         label,
         source,
     }
 }
 
-pub fn propagate_all(set: &SatSet, t: DateTime<Utc>) -> Vec<SatGpu> {
+pub fn propagate_all(set: &SatSet, t: DateTime<Utc>) -> (Vec<SatGpu>, Vec<u32>) {
     let gmst = astro::gmst_rad(t);
     let naive = t.naive_utc();
     set.entries
         .par_iter()
-        .filter_map(|s| {
+        .enumerate()
+        .filter_map(|(i, s)| {
             let minutes = (naive - s.epoch).num_milliseconds() as f64 / 60_000.0;
             let p = s
                 .constants
@@ -168,19 +178,22 @@ pub fn propagate_all(set: &SatSet, t: DateTime<Utc>) -> Vec<SatGpu> {
             let v_e = astro::teme_vel_to_ecef(gmst, r_e, v_teme);
             let rw = astro::ecef_to_world(r_e) / astro::EARTH_RADIUS_KM;
             let vw = astro::ecef_to_world(v_e) / astro::EARTH_RADIUS_KM;
-            Some(SatGpu {
-                pos: [rw.x as f32, rw.y as f32, rw.z as f32, s.kind as f32],
-                vel: [vw.x as f32, vw.y as f32, vw.z as f32, s.bright],
-            })
+            Some((
+                SatGpu {
+                    pos: [rw.x as f32, rw.y as f32, rw.z as f32, s.kind as f32],
+                    vel: [vw.x as f32, vw.y as f32, vw.z as f32, s.bright],
+                },
+                i as u32,
+            ))
         })
-        .collect()
+        .unzip()
 }
 
 /// One-shot propagation for headless screenshots.
 pub fn offline_states() -> (Vec<SatGpu>, f64, String, Source) {
     let set = build_set(true);
     let t = Utc::now();
-    let states = propagate_all(&set, t);
+    let (states, _idxs) = propagate_all(&set, t);
     (
         states,
         astro::unix_seconds(t),
@@ -191,6 +204,7 @@ pub fn offline_states() -> (Vec<SatGpu>, f64, String, Source) {
 
 pub fn run(tx: Sender<DataMsg>) {
     let mut set = build_set(false);
+    let _ = tx.send(DataMsg::SatNames(set.names.clone()));
     let _ = tx.send(DataMsg::Note(format!(
         "satellite catalog ready: {} ({})",
         set.label,
@@ -200,10 +214,11 @@ pub fn run(tx: Sender<DataMsg>) {
 
     loop {
         let t = Utc::now();
-        let states = propagate_all(&set, t);
+        let (states, idxs) = propagate_all(&set, t);
         let msg = DataMsg::Sats {
             t0_unix: astro::unix_seconds(t),
             states,
+            idxs,
             label: set.label.clone(),
             source: set.source,
         };
@@ -215,6 +230,7 @@ pub fn run(tx: Sender<DataMsg>) {
             let fresh = build_set(false);
             if !fresh.entries.is_empty() {
                 set = fresh;
+                let _ = tx.send(DataMsg::SatNames(set.names.clone()));
                 let _ = tx.send(DataMsg::Note(format!(
                     "satellite catalog refreshed: {}",
                     set.label
