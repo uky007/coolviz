@@ -7,6 +7,7 @@ use super::{
 pub struct PostPass {
     comp_pipeline: wgpu::RenderPipeline,
     comp_bgl: wgpu::BindGroupLayout,
+    down_first_pipeline: wgpu::RenderPipeline,
     down_pipeline: wgpu::RenderPipeline,
     up_pipeline: wgpu::RenderPipeline,
     sample_bgl: wgpu::BindGroupLayout,
@@ -94,6 +95,15 @@ impl PostPass {
             HDR_FORMAT,
             None,
         );
+        let down_first_pipeline = full_pipeline(
+            device,
+            &shader,
+            "bloom-down-first",
+            "fs_down_first",
+            &comp_bgl,
+            HDR_FORMAT,
+            None,
+        );
         let down_pipeline = full_pipeline(
             device,
             &shader,
@@ -125,6 +135,7 @@ impl PostPass {
         Self {
             comp_pipeline,
             comp_bgl,
+            down_first_pipeline,
             down_pipeline,
             up_pipeline,
             sample_bgl,
@@ -221,6 +232,12 @@ impl PostPass {
 
     pub fn record_composite(&self, rp: &mut wgpu::RenderPass<'_>, bg: &wgpu::BindGroup) {
         rp.set_pipeline(&self.comp_pipeline);
+        rp.set_bind_group(0, bg, &[]);
+        rp.draw(0..3, 0..1);
+    }
+
+    pub fn record_down_first(&self, rp: &mut wgpu::RenderPass<'_>, bg: &wgpu::BindGroup) {
+        rp.set_pipeline(&self.down_first_pipeline);
         rp.set_bind_group(0, bg, &[]);
         rp.draw(0..3, 0..1);
     }

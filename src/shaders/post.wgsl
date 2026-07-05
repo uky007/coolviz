@@ -12,6 +12,7 @@ struct Globals {
     viewport: vec4<f32>,
     params: vec4<f32>, // x trail_gain, z exposure
     layers: vec4<f32>,
+    layers2: vec4<f32>, // z = bloom threshold
 };
 
 @group(0) @binding(0) var<uniform> G: Globals;
@@ -36,6 +37,21 @@ fn fs_composite(in: FullOut) -> @location(0) vec4<f32> {
     let hdr = textureSampleLevel(tex_a, samp, in.uv, 0.0).rgb;
     let trail = textureSampleLevel(tex_b, samp, in.uv, 0.0).rgb;
     return vec4(hdr + trail * G.params.x, 1.0);
+}
+
+// First bloom downsample: apply the soft threshold from G.layers2.z.
+@fragment
+fn fs_down_first(in: FullOut) -> @location(0) vec4<f32> {
+    let ts = 1.0 / vec2<f32>(textureDimensions(tex_a));
+    var c = vec3(0.0);
+    c += textureSampleLevel(tex_a, samp, in.uv + vec2(-0.75, -0.75) * ts, 0.0).rgb;
+    c += textureSampleLevel(tex_a, samp, in.uv + vec2(0.75, -0.75) * ts, 0.0).rgb;
+    c += textureSampleLevel(tex_a, samp, in.uv + vec2(-0.75, 0.75) * ts, 0.0).rgb;
+    c += textureSampleLevel(tex_a, samp, in.uv + vec2(0.75, 0.75) * ts, 0.0).rgb;
+    c *= 0.25;
+    let thr = G.layers2.z;
+    c = max(c - vec3(thr), vec3(0.0));
+    return vec4(c, 1.0);
 }
 
 @fragment

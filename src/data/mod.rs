@@ -4,7 +4,9 @@
 pub mod coast;
 pub mod himawari;
 pub mod landmask;
+pub mod plateau;
 pub mod quakes;
+pub mod rain;
 pub mod sats;
 pub mod wind;
 
@@ -72,6 +74,18 @@ pub enum DataMsg {
         rgba: Vec<u8>,
         label: String,
     },
+    CityMesh {
+        verts: Vec<[f32; 4]>,
+        indices: Vec<u32>,
+        label: String,
+    },
+    Rain {
+        size: u32,
+        levels: Vec<u8>,
+        bounds: [f64; 4],
+        label: String,
+        max_level: u8,
+    },
     Note(String),
 }
 
@@ -100,6 +114,34 @@ pub fn spawn(tx: Sender<DataMsg>) {
     std::thread::Builder::new()
         .name("himawari".into())
         .spawn(move || himawari::run(tx))
+        .ok();
+}
+
+/// Start the (one-shot) PLATEAU city loader. Call once, lazily.
+pub fn spawn_city(tx: Sender<DataMsg>) {
+    std::thread::Builder::new()
+        .name("plateau".into())
+        .spawn(move || match plateau::load_city() {
+            Ok(mesh) => {
+                let _ = tx.send(DataMsg::CityMesh {
+                    verts: mesh.verts,
+                    indices: mesh.indices,
+                    label: mesh.label,
+                });
+            }
+            Err(e) => {
+                log::error!("plateau load failed: {e:#}");
+                let _ = tx.send(DataMsg::Note(format!("PLATEAU load failed: {e}")));
+            }
+        })
+        .ok();
+}
+
+/// Start the JMA nowcast poller. Call once, lazily.
+pub fn spawn_rain(tx: Sender<DataMsg>) {
+    std::thread::Builder::new()
+        .name("rain".into())
+        .spawn(move || rain::run(tx, plateau::SITE_LON, plateau::SITE_LAT))
         .ok();
 }
 

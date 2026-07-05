@@ -10,7 +10,18 @@
 |---|---|
 | ![typhoon](docs/typhoon.png) | ![night](docs/night.png) |
 
-**EN:** A mission-control Earth in native Rust + wgpu — a raytraced textureless globe with up to 2M compute-shader wind particles advected by live NOAA GFS data, ~16,000 satellites propagated with SGP4 (LEO swarm + the GEO belt), live USGS earthquakes, and Himawari-9 true-color clouds reprojected from geostationary orbit. Boots offline from vendored snapshots, swaps to live feeds in the background. `cargo run --release`.
+**EN:** A mission-control Earth in native Rust + wgpu — a raytraced textureless globe with up to 2M compute-shader wind particles advected by live NOAA GFS data, ~16,000 satellites propagated with SGP4 (LEO swarm + the GEO belt), live USGS earthquakes, and Himawari-9 true-color clouds reprojected from geostationary orbit. Boots offline from vendored snapshots, swaps to live feeds in the background. Plus two local scenes: **TOKYO STORM** (real PLATEAU buildings + live JMA rain nowcast falling as GPU particles) and **OKINAWA SEA** (a fully procedural, physically-inspired reef lagoon). `cargo run --release`.
+
+## モード
+
+HUD 上部の **EARTH / TOKYO / OKINAWA** で切替。
+
+| TOKYO STORM ⛈️ | OKINAWA SEA 🏝️ |
+|---|---|
+| ![tokyo](docs/tokyo.png) | ![okinawa](docs/okinawa.png) |
+
+- **TOKYO STORM** — [Project PLATEAU](https://www.mlit.go.jp/plateau/) の実3D建物（千代田区 LOD1、初回起動時に自動取得・キャッシュ）に、JMA 高解像度降水ナウキャストの実況雨を35万粒の GPU パーティクルとして降らせる。窓明かり・濡れた路面・嵐の雲は手続き生成。晴れの日のために合成スコール（demo storm）切替つき — 実況で雨が降り始めると自動でライブに切替
+- **OKINAWA SEA** — データ無しの物理再現：深度による光吸収（エメラルド→コバルト）、海底コースティクス、リーフ外縁の砕波、砂浜と植生、積雲。全部1本のレイマーチシェーダー
 
 ## レイヤー
 
@@ -47,6 +58,8 @@ cargo run --release
 ```sh
 cargo run --release -- --shot out.png --frames 240 --size 1920x1080 \
     --lat 17 --lon 136 --dist 1.85
+# ローカルシーン: --mode tokyo / --mode okinawa (--demo 0 でライブ雨のみ)
+cargo run --release -- --shot tokyo.png --mode tokyo --lat 16 --lon 215 --dist 1.9
 ```
 
 動画用の連番フレーム出力（ffmpeg があれば mp4 化）：
@@ -65,6 +78,8 @@ ffmpeg -framerate 30 -i frames/%04d.png -c:v libx264 -pix_fmt yuv420p -crf 18 co
 | 衛星軌道 | [CelesTrak](https://celestrak.org) GP (GROUP=active) | **2時間キャッシュ厳守**（先方ポリシー）。fallback は同梱スナップショット |
 | 地震 | [USGS](https://earthquake.usgs.gov) 2.5_day GeoJSON | 5分毎 |
 | 海岸線・陸地 | [Natural Earth](https://www.naturalearthdata.com) 50m/110m | パブリックドメイン、`assets/` に同梱 |
+| 3D都市モデル | [Project PLATEAU](https://www.mlit.go.jp/plateau/)（国土交通省）東京23区 3D Tiles (2020) | CC BY 4.0 相当。初回起動時に取得し `.cache/plateau/` へ（~40MB） |
+| 雨雲ナウキャスト | JMA 高解像度降水ナウキャスト タイル | ⚠️ 非公式エンドポイント。latest確認は2分毎・タイル取得は新画像時のみ |
 
 **ライセンス**：コードは MIT（[LICENSE](LICENSE)）。データスナップショットとスクリーンショットの出所・条件は [NOTICE.md](NOTICE.md) を参照。特に `docs/hero.png` と `docs/typhoon.png` はひまわり9号画像（NICT・**非商用限定**）を含むため MIT の対象外です。
 

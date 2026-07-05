@@ -4,9 +4,11 @@
 
 mod coast;
 mod globe;
+mod ocean;
 mod particles;
 mod post;
 mod sprites;
+mod tokyo;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -18,6 +20,13 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub const FINAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const BLOOM_MIPS: u32 = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SceneMode {
+    Earth,
+    Tokyo,
+    Okinawa,
+}
 
 pub struct SceneAssets {
     pub land_w: u32,
@@ -61,6 +70,9 @@ pub struct FrameInput {
     pub warp: f32,
     pub trail_fade: f32,
     pub frame_index: u32,
+    pub mode: SceneMode,
+    /// Tokyo mode: use the procedural demo storm instead of live nowcast.
+    pub rain_demo: bool,
 }
 
 struct Targets {
@@ -75,6 +87,7 @@ struct Targets {
     // Bind groups that reference per-size views.
     fade_bgs: [wgpu::BindGroup; 2], // [write_into_i] samples 1-i
     comp_bgs: [wgpu::BindGroup; 2], // [trail_source_i]
+    down_first_bg: wgpu::BindGroup,
     down_bgs: Vec<wgpu::BindGroup>,
     up_bgs: Vec<wgpu::BindGroup>,
     tone_bg: wgpu::BindGroup,
@@ -90,6 +103,8 @@ pub struct Scene {
     pub sats: SpritePass,
     pub quakes: SpritePass,
     post: post::PostPass,
+    pub tokyo: tokyo::TokyoPass,
+    ocean: ocean::OceanPass,
     targets: Option<Targets>,
     trail_front: usize,
     have_clouds: bool,
@@ -143,6 +158,8 @@ impl Scene {
             1_000,
         );
         let post = post::PostPass::new(device);
+        let tokyo = tokyo::TokyoPass::new(device, &globals_buf, &clamp_samp);
+        let ocean = ocean::OceanPass::new(device, &globals_buf);
 
         Self {
             globals_buf,
@@ -154,10 +171,35 @@ impl Scene {
             sats,
             quakes,
             post,
+            tokyo,
+            ocean,
             targets: None,
             trail_front: 0,
             have_clouds: false,
         }
+    }
+
+    pub fn upload_city(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
+        self.tokyo.upload_city(device, verts, indices);
+    }
+
+    pub fn upload_rain(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        size: u32,
+        levels: &[u8],
+        bounds: [f64; 4],
+    ) {
+        self.tokyo.upload_rain(
+            device,
+            queue,
+            &self.globals_buf,
+            &self.clamp_samp,
+            size,
+            levels,
+            bounds,
+        );
     }
 
     pub fn upload_wind(
@@ -307,11 +349,14 @@ impl Scene {
                 &self.clamp_samp,
             ),
         ];
-        let mut down_bgs = Vec::new();
-        down_bgs.push(
-            self.post
-                .make_sample_bg(device, &comp_view, &self.clamp_samp),
+        let down_first_bg = self.post.make_comp_bg(
+            device,
+            &self.globals_buf,
+            &comp_view,
+            &comp_view,
+            &self.clamp_samp,
         );
+        let mut down_bgs = Vec::new();
         for view in &bloom_views[..(BLOOM_MIPS - 1) as usize] {
             down_bgs.push(self.post.make_sample_bg(device, view, &self.clamp_samp));
         }
@@ -341,6 +386,7 @@ impl Scene {
             final_view,
             fade_bgs,
             comp_bgs,
+            down_first_bg,
             down_bgs,
             up_bgs,
             tone_bg,
@@ -370,11 +416,25 @@ impl Scene {
             ],
             params: [f.trail_gain, f.sat_dt, f.exposure, f.res_scale],
             layers: f.layers,
-            layers2: [f.clouds, if self.have_clouds { 1.0 } else { 0.0 }, 0.0, 0.0],
+            layers2: [
+                f.clouds,
+                if self.have_clouds { 1.0 } else { 0.0 },
+                // Bloom threshold: bright daylight scenes only glow above it.
+                if f.mode == SceneMode::Okinawa {
+                    0.55
+                } else {
+                    0.0
+                },
+                0.0,
+            ],
         };
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&g));
         self.particles
             .write_params(queue, f.sim_dt, f.warp, f.frame_index, f.trail_fade);
+        if f.mode == SceneMode::Tokyo {
+            self.tokyo
+                .write_params(queue, f.rain_demo, f.sim_dt, f.frame_index);
+        }
 
         let front = self.trail_front;
         let back = 1 - front;
@@ -384,8 +444,23 @@ impl Scene {
             label: Some("frame"),
         });
 
-        // 1. Scene pass: globe (writes depth), coastlines, satellites, quakes.
+        // 1+2. Mode-specific scene pass and simulation pass.
         {
+            if f.mode == SceneMode::Earth && f.layers[0] > 0.001 {
+                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("wind-sim"),
+                    timestamp_writes: None,
+                });
+                self.particles.record_sim(&mut cp);
+            }
+            if f.mode == SceneMode::Tokyo {
+                let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("rain-sim"),
+                    timestamp_writes: None,
+                });
+                self.tokyo.record_sim(&mut cp);
+            }
+
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -414,25 +489,22 @@ impl Scene {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.globe.record(&mut rp);
-            if f.layers[3] > 0.001 {
-                self.coast.record(&mut rp);
+            match f.mode {
+                SceneMode::Earth => {
+                    self.globe.record(&mut rp);
+                    if f.layers[3] > 0.001 {
+                        self.coast.record(&mut rp);
+                    }
+                    if f.layers[1] > 0.001 {
+                        self.sats.record(&mut rp);
+                    }
+                    if f.layers[2] > 0.001 {
+                        self.quakes.record(&mut rp);
+                    }
+                }
+                SceneMode::Tokyo => self.tokyo.record(&mut rp),
+                SceneMode::Okinawa => self.ocean.record(&mut rp),
             }
-            if f.layers[1] > 0.001 {
-                self.sats.record(&mut rp);
-            }
-            if f.layers[2] > 0.001 {
-                self.quakes.record(&mut rp);
-            }
-        }
-
-        // 2. Particle simulation.
-        if f.layers[0] > 0.001 {
-            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wind-sim"),
-                timestamp_writes: None,
-            });
-            self.particles.record_sim(&mut cp);
         }
 
         // 3. Trail fade: back <- front * fade.
@@ -457,7 +529,7 @@ impl Scene {
         }
 
         // 4. Particle segments, additively, depth-tested against the globe.
-        if f.layers[0] > 0.001 {
+        if f.mode == SceneMode::Earth && f.layers[0] > 0.001 {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("trail-segments"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -506,7 +578,26 @@ impl Scene {
         }
 
         // 6. Bloom chain.
-        for (view, bg) in t.bloom_views.iter().zip(&t.down_bgs) {
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-down-first"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.bloom_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.post.record_down_first(&mut rp, &t.down_first_bg);
+        }
+        for (view, bg) in t.bloom_views[1..].iter().zip(&t.down_bgs) {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bloom-down"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

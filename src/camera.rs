@@ -92,6 +92,17 @@ impl OrbitCamera {
         crate::astro::latlon_to_world(self.lat, self.lon) * self.dist
     }
 
+    /// Matrices for a local, meter-scale scene (city / ocean modes): same
+    /// orbit parameters, but around `target` with near/far tuned for meters.
+    pub fn matrices_local(&self, aspect: f32, target: Vec3, dist_m: f32) -> (Mat4, Mat4, Vec3) {
+        let dir = crate::astro::latlon_to_world(self.lat, self.lon);
+        let eye = target + dir * dist_m;
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(46.0_f32.to_radians(), aspect.max(0.1), 2.0, 60_000.0);
+        let vp = proj * view;
+        (vp, vp.inverse(), eye)
+    }
+
     /// Returns (view_proj, inv_view_proj, eye).
     pub fn matrices(&self, aspect: f32) -> (Mat4, Mat4, Vec3) {
         let eye = self.eye();

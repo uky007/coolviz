@@ -20,7 +20,13 @@ use eframe::egui;
 
 use camera::OrbitCamera;
 use data::{DataMsg, QuakeCpu, Source};
-use scene::{FrameInput, Scene, SceneAssets};
+use scene::{FrameInput, Scene, SceneAssets, SceneMode};
+
+/// HUD orbit distance (1.18..20) -> meters, per local mode.
+const TOKYO_DIST_SCALE: f32 = 450.0;
+const OKINAWA_DIST_SCALE: f32 = 42.0;
+const TOKYO_TARGET: glam::Vec3 = glam::Vec3::new(0.0, 70.0, 0.0);
+const OKINAWA_TARGET: glam::Vec3 = glam::Vec3::new(0.0, 3.0, 0.0);
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(84, 220, 255);
 const DIM: egui::Color32 = egui::Color32::from_rgb(110, 138, 158);
@@ -93,11 +99,19 @@ struct Status {
     sats: Option<(Source, String, usize)>,
     quakes: Option<(String, usize)>,
     clouds: Option<String>,
+    city: Option<String>,
+    rain: Option<(String, u8)>,
 }
 
 struct App {
     scene: Scene,
     cam: OrbitCamera,
+    cam_city: OrbitCamera,
+    cam_ocean: OrbitCamera,
+    mode: SceneMode,
+    tx: std::sync::mpsc::Sender<DataMsg>,
+    city_spawned: bool,
+    rain_demo: bool,
     rx: Receiver<DataMsg>,
     status: Status,
     app_epoch_unix: f64,
@@ -129,17 +143,33 @@ impl App {
         apply_style(&cc.egui_ctx);
         let scene = Scene::new(&rs.device, &rs.queue, &assets);
         let (tx, rx) = std::sync::mpsc::channel();
-        data::spawn(tx);
+        data::spawn(tx.clone());
         let now = Utc::now();
+        let mut cam_city = OrbitCamera::new();
+        cam_city.lat = 26.0;
+        cam_city.lon = 205.0;
+        cam_city.dist = 3.4;
+        let mut cam_ocean = OrbitCamera::new();
+        cam_ocean.lat = 11.0;
+        cam_ocean.lon = 145.0;
+        cam_ocean.dist = 3.6;
         Self {
             scene,
             cam: OrbitCamera::new(),
+            cam_city,
+            cam_ocean,
+            mode: SceneMode::Earth,
+            tx,
+            city_spawned: false,
+            rain_demo: true,
             rx,
             status: Status {
                 wind: None,
                 sats: None,
                 quakes: None,
                 clouds: None,
+                city: None,
+                rain: None,
             },
             app_epoch_unix: astro::unix_seconds(now),
             last_frame: Instant::now(),
@@ -203,6 +233,29 @@ impl App {
                     self.scene.upload_clouds(&rs.device, &rs.queue, w, h, &rgba);
                     self.status.clouds = Some(label);
                 }
+                DataMsg::CityMesh {
+                    verts,
+                    indices,
+                    label,
+                } => {
+                    self.scene.upload_city(&rs.device, &verts, &indices);
+                    self.status.city = Some(label);
+                }
+                DataMsg::Rain {
+                    size,
+                    levels,
+                    bounds,
+                    label,
+                    max_level,
+                } => {
+                    self.scene
+                        .upload_rain(&rs.device, &rs.queue, size, &levels, bounds);
+                    // Auto-switch to live rain the moment there is real rain.
+                    if max_level > 0 {
+                        self.rain_demo = false;
+                    }
+                    self.status.rain = Some((label, max_level));
+                }
                 DataMsg::Note(s) => log::info!("{s}"),
             }
         }
@@ -210,7 +263,19 @@ impl App {
 
     fn frame_input(&self, px: (u32, u32), dt: f32) -> FrameInput {
         let aspect = px.0 as f32 / px.1.max(1) as f32;
-        let (vp, ivp, eye) = self.cam.matrices(aspect);
+        let (vp, ivp, eye) = match self.mode {
+            SceneMode::Earth => self.cam.matrices(aspect),
+            SceneMode::Tokyo => self.cam_city.matrices_local(
+                aspect,
+                TOKYO_TARGET,
+                self.cam_city.dist * TOKYO_DIST_SCALE,
+            ),
+            SceneMode::Okinawa => self.cam_ocean.matrices_local(
+                aspect,
+                OKINAWA_TARGET,
+                self.cam_ocean.dist * OKINAWA_DIST_SCALE,
+            ),
+        };
         let utc = Utc::now();
         let unix = astro::unix_seconds(utc);
         let sat_dt = self.sat_t0_unix.map(|t0| (unix - t0) as f32).unwrap_or(0.0);
@@ -235,6 +300,17 @@ impl App {
             warp: self.warp,
             trail_fade: lerp(0.958, 0.85, self.cam.motion.min(1.0)),
             frame_index: self.frame_index,
+            mode: self.mode,
+            rain_demo: self.rain_demo,
+        }
+    }
+
+    fn set_mode(&mut self, mode: SceneMode) {
+        self.mode = mode;
+        if mode == SceneMode::Tokyo && !self.city_spawned {
+            self.city_spawned = true;
+            data::spawn_city(self.tx.clone());
+            data::spawn_rain(self.tx.clone());
         }
     }
 
@@ -265,7 +341,101 @@ impl App {
                         .size(11.5)
                         .color(DIM),
                 );
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let mut m = self.mode;
+                    for (mode, name) in [
+                        (SceneMode::Earth, "EARTH"),
+                        (SceneMode::Tokyo, "TOKYO"),
+                        (SceneMode::Okinawa, "OKINAWA"),
+                    ] {
+                        if ui
+                            .selectable_label(
+                                m == mode,
+                                egui::RichText::new(name).monospace().size(12.0),
+                            )
+                            .clicked()
+                        {
+                            m = mode;
+                        }
+                    }
+                    if m != self.mode {
+                        self.set_mode(m);
+                    }
+                });
                 ui.separator();
+
+                if self.mode == SceneMode::Tokyo {
+                    match &self.status.city {
+                        Some(label) => status_row(
+                            ui,
+                            "CITY",
+                            egui::Color32::from_rgb(70, 225, 255),
+                            label.clone(),
+                        ),
+                        None => status_row(
+                            ui,
+                            "CITY",
+                            egui::Color32::from_rgb(255, 210, 100),
+                            "loading PLATEAU tiles…".into(),
+                        ),
+                    }
+                    match &self.status.rain {
+                        Some((label, max)) => {
+                            let c = if *max > 0 {
+                                egui::Color32::from_rgb(70, 225, 255)
+                            } else {
+                                egui::Color32::from_rgb(255, 210, 100)
+                            };
+                            status_row(ui, "RAIN", c, label.clone());
+                        }
+                        None => status_row(
+                            ui,
+                            "RAIN",
+                            egui::Color32::from_rgb(255, 90, 90),
+                            "waiting…".into(),
+                        ),
+                    }
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.rain_demo, "demo storm");
+                        ui.checkbox(&mut self.cam_city.auto_orbit, "auto-orbit");
+                    });
+                    if self.rain_demo {
+                        ui.label(
+                            egui::RichText::new("synthetic squall — uncheck for live JMA nowcast")
+                                .monospace()
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(255, 170, 110)),
+                        );
+                    }
+                    ui.add(egui::Slider::new(&mut self.exposure, 0.5..=2.5).text("exposure"));
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{:>5.1} fps", self.fps))
+                            .monospace()
+                            .size(11.0)
+                            .color(DIM),
+                    );
+                    return;
+                }
+                if self.mode == SceneMode::Okinawa {
+                    ui.label(
+                        egui::RichText::new("procedural reef lagoon — no data feeds")
+                            .monospace()
+                            .size(10.5)
+                            .color(DIM),
+                    );
+                    ui.checkbox(&mut self.cam_ocean.auto_orbit, "auto-orbit");
+                    ui.add(egui::Slider::new(&mut self.exposure, 0.5..=2.5).text("exposure"));
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{:>5.1} fps", self.fps))
+                            .monospace()
+                            .size(11.0)
+                            .color(DIM),
+                    );
+                    return;
+                }
 
                 match &self.status.wind {
                     Some((src, label)) => status_row(
@@ -441,9 +611,31 @@ impl eframe::App for App {
             (0.0, 1.0)
         };
         if resp.double_clicked() {
-            self.cam.reset();
+            match self.mode {
+                SceneMode::Earth => self.cam.reset(),
+                SceneMode::Tokyo => {
+                    self.cam_city.lat = 26.0;
+                    self.cam_city.lon = 205.0;
+                    self.cam_city.dist = 3.4;
+                }
+                SceneMode::Okinawa => {
+                    self.cam_ocean.lat = 11.0;
+                    self.cam_ocean.lon = 145.0;
+                    self.cam_ocean.dist = 3.6;
+                }
+            }
         }
-        self.cam.update(dt, drag, scroll, pinch, avail.y);
+        match self.mode {
+            SceneMode::Earth => self.cam.update(dt, drag, scroll, pinch, avail.y),
+            SceneMode::Tokyo => {
+                self.cam_city.update(dt, drag, scroll, pinch, avail.y);
+                self.cam_city.lat = self.cam_city.lat.max(4.0);
+            }
+            SceneMode::Okinawa => {
+                self.cam_ocean.update(dt, drag, scroll, pinch, avail.y);
+                self.cam_ocean.lat = self.cam_ocean.lat.clamp(2.0, 60.0);
+            }
+        }
 
         let fi = self.frame_input(px, dt);
         let view = self.scene.render(&rs.device, &rs.queue, px, &fi);
@@ -470,7 +662,8 @@ impl eframe::App for App {
         }
 
         // ISS marker + label, projected and occlusion-tested on the CPU.
-        if self.show_sats
+        if self.mode == SceneMode::Earth
+            && self.show_sats
             && self.show_hud
             && let Some((p, v)) = self.iss
         {
@@ -546,6 +739,8 @@ struct ShotOpts {
     /// Camera distance multiplier per second (1.0 = hold, <1 = push in).
     dzoom: f32,
     trail_fade: f32,
+    mode: SceneMode,
+    demo: bool,
 }
 
 fn read_final(
@@ -622,31 +817,48 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
     let mut scene = Scene::new(&device, &queue, &assets);
     let app_epoch_unix = astro::unix_seconds(Utc::now());
 
-    match data::wind::load_snapshot() {
-        Ok(g) => {
-            log::info!("shot: wind {} ({})", g.label, g.source.tag());
-            scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
-        }
-        Err(e) => {
-            log::warn!("shot: wind snapshot failed ({e:#}), using synthetic");
-            let g = data::wind::synthetic();
-            scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
+    if o.mode == SceneMode::Tokyo {
+        let mesh = data::plateau::load_city()?;
+        log::info!("shot: {}", mesh.label);
+        scene.upload_city(&device, &mesh.verts, &mesh.indices);
+        match data::rain::fetch_once(data::plateau::SITE_LON, data::plateau::SITE_LAT) {
+            Ok(g) => {
+                log::info!("shot: rain {} (max lv{})", g.label, g.max_level);
+                scene.upload_rain(&device, &queue, g.size, &g.levels, g.bounds);
+            }
+            Err(e) => log::warn!("shot: rain unavailable ({e})"),
         }
     }
-    let (states, sat_t0, label, source) = data::sats::offline_states();
-    log::info!("shot: {} sats ({} · {})", states.len(), label, source.tag());
-    scene.upload_sats(&device, &queue, bytemuck::cast_slice(&states));
-    match data::quakes::fetch_once() {
-        Ok((list, label)) => {
-            log::info!("shot: quakes {label}");
-            let packed = pack_quakes(&list, app_epoch_unix);
-            scene.upload_quakes(&device, &queue, bytemuck::cast_slice(&packed));
+
+    let mut sat_t0 = app_epoch_unix;
+    if o.mode == SceneMode::Earth {
+        match data::wind::load_snapshot() {
+            Ok(g) => {
+                log::info!("shot: wind {} ({})", g.label, g.source.tag());
+                scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
+            }
+            Err(e) => {
+                log::warn!("shot: wind snapshot failed ({e:#}), using synthetic");
+                let g = data::wind::synthetic();
+                scene.upload_wind(&device, &queue, g.w, g.h, &g.data);
+            }
         }
-        Err(e) => log::warn!("shot: quakes unavailable ({e})"),
-    }
-    if let Some(c) = data::himawari::fetch_once() {
-        log::info!("shot: clouds {}", c.label);
-        scene.upload_clouds(&device, &queue, c.w, c.h, &c.rgba);
+        let (states, t0, label, source) = data::sats::offline_states();
+        sat_t0 = t0;
+        log::info!("shot: {} sats ({} · {})", states.len(), label, source.tag());
+        scene.upload_sats(&device, &queue, bytemuck::cast_slice(&states));
+        match data::quakes::fetch_once() {
+            Ok((list, label)) => {
+                log::info!("shot: quakes {label}");
+                let packed = pack_quakes(&list, app_epoch_unix);
+                scene.upload_quakes(&device, &queue, bytemuck::cast_slice(&packed));
+            }
+            Err(e) => log::warn!("shot: quakes unavailable ({e})"),
+        }
+        if let Some(c) = data::himawari::fetch_once() {
+            log::info!("shot: clouds {}", c.label);
+            scene.upload_clouds(&device, &queue, c.w, c.h, &c.rgba);
+        }
     }
 
     let mut cam = OrbitCamera::new();
@@ -665,7 +877,15 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
         cam.dist *= o.dzoom.powf(dt);
         cam.update(dt, (0.0, 0.0), 0.0, 1.0, o.size.1 as f32);
         let aspect = o.size.0 as f32 / o.size.1 as f32;
-        let (vp, ivp, eye) = cam.matrices(aspect);
+        let (vp, ivp, eye) = match o.mode {
+            SceneMode::Earth => cam.matrices(aspect),
+            SceneMode::Tokyo => {
+                cam.matrices_local(aspect, TOKYO_TARGET, cam.dist * TOKYO_DIST_SCALE)
+            }
+            SceneMode::Okinawa => {
+                cam.matrices_local(aspect, OKINAWA_TARGET, cam.dist * OKINAWA_DIST_SCALE)
+            }
+        };
         let utc = Utc::now();
         let unix = astro::unix_seconds(utc);
         let fi = FrameInput {
@@ -684,6 +904,8 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
             warp: 6000.0,
             trail_fade: o.trail_fade,
             frame_index: i,
+            mode: o.mode,
+            rain_demo: o.demo,
         };
         scene.render(&device, &queue, o.size, &fi);
         if let Some(dir) = &o.framedump
@@ -718,6 +940,8 @@ fn main() -> anyhow::Result<()> {
     let mut warmup = 150u32;
     let mut dzoom = 1.0f32;
     let mut trail_fade = 0.958f32;
+    let mut mode = SceneMode::Earth;
+    let mut demo = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -744,6 +968,14 @@ fn main() -> anyhow::Result<()> {
             "--warmup" => warmup = parse_u32(&mut args, warmup, 0, 5_000),
             "--dzoom" => dzoom = parse_f32(&mut args, dzoom, 0.5, 1.5),
             "--trailfade" => trail_fade = parse_f32(&mut args, trail_fade, 0.5, 0.998),
+            "--mode" => {
+                mode = match args.next().as_deref() {
+                    Some("tokyo") => SceneMode::Tokyo,
+                    Some("okinawa") => SceneMode::Okinawa,
+                    _ => SceneMode::Earth,
+                }
+            }
+            "--demo" => demo = args.next().as_deref() != Some("0"),
             other => log::warn!("unknown arg: {other}"),
         }
     }
@@ -764,6 +996,8 @@ fn main() -> anyhow::Result<()> {
                 warmup,
                 dzoom,
                 trail_fade,
+                mode,
+                demo,
             },
             assets,
         );
