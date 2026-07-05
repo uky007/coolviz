@@ -81,7 +81,10 @@ pub fn build(w: u32, h: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     for y in south_row..h {
         let row = (y * w) as usize;
         // Only fill if the row already contains substantial land (Antarctica).
-        let filled = mask[row..row + w as usize].iter().filter(|&&m| m > 0).count();
+        let filled = mask[row..row + w as usize]
+            .iter()
+            .filter(|&&m| m > 0)
+            .count();
         if filled > (w as usize) / 4 {
             for x in 0..w as usize {
                 mask[row + x] = 255;
@@ -90,4 +93,24 @@ pub fn build(w: u32, h: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     }
 
     Ok((w, h, mask))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rasterizes_recognizable_land() {
+        let (w, h, mask) = super::build(512, 256).expect("landmask builds");
+        let at = |lat: f64, lon: f64| -> u8 {
+            let x = (((lon + 180.0) / 360.0) * w as f64) as usize;
+            let y = (((90.0 - lat) / 180.0) * h as f64) as usize;
+            mask[y * w as usize + x]
+        };
+        assert_eq!(at(-25.0, 133.0), 255, "central Australia should be land");
+        assert_eq!(at(25.0, 10.0), 255, "Sahara should be land");
+        assert_eq!(at(0.0, -160.0), 0, "mid-Pacific should be ocean");
+        assert_eq!(at(-80.0, 0.0), 255, "Antarctica should be land");
+
+        let frac = mask.iter().filter(|&&m| m > 0).count() as f64 / mask.len() as f64;
+        assert!((0.20..0.45).contains(&frac), "land fraction {frac:.3}");
+    }
 }

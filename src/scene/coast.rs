@@ -2,7 +2,7 @@
 
 use wgpu::util::DeviceExt;
 
-use super::{depth_test_no_write, uniform_entry, ADDITIVE_BLEND, HDR_FORMAT};
+use super::{ADDITIVE_BLEND, HDR_FORMAT, depth_test_no_write, uniform_entry};
 
 pub struct CoastPass {
     pipeline: wgpu::RenderPipeline,
@@ -13,11 +13,7 @@ pub struct CoastPass {
 }
 
 impl CoastPass {
-    pub fn new(
-        device: &wgpu::Device,
-        globals: &wgpu::Buffer,
-        assets: &super::SceneAssets,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, globals: &wgpu::Buffer, assets: &super::SceneAssets) -> Self {
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("coast-verts"),
             contents: bytemuck::cast_slice(&assets.coast_vertices),

@@ -58,3 +58,20 @@ pub fn load() -> anyhow::Result<(Vec<[f32; 3]>, Vec<u32>)> {
     anyhow::ensure!(!verts.is_empty(), "no coastline geometry parsed");
     Ok((verts, idx))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn loads_coastline_strips_on_the_sphere() {
+        let (verts, idx) = super::load().expect("coastline loads");
+        assert!(verts.len() > 50_000, "only {} vertices", verts.len());
+        assert!(idx.contains(&u32::MAX), "no primitive-restart separators");
+        for v in verts.iter().step_by(997) {
+            let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            assert!(
+                (r - super::COAST_RADIUS).abs() < 1e-3,
+                "vertex off sphere: {r}"
+            );
+        }
+    }
+}

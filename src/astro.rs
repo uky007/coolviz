@@ -52,11 +52,7 @@ pub fn ecef_to_world(p: DVec3) -> DVec3 {
 pub fn latlon_to_world(lat_deg: f32, lon_deg: f32) -> Vec3 {
     let lat = lat_deg.to_radians();
     let lon = lon_deg.to_radians();
-    Vec3::new(
-        lat.cos() * lon.cos(),
-        lat.sin(),
-        -lat.cos() * lon.sin(),
-    )
+    Vec3::new(lat.cos() * lon.cos(), lat.sin(), -lat.cos() * lon.sin())
 }
 
 /// Unit sun direction in world frame (low-precision solar ephemeris, ~0.01 deg).

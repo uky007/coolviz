@@ -7,7 +7,7 @@ use anyhow::Context;
 use chrono::{Datelike, DurationRound, Timelike, Utc};
 use half::f16;
 
-use super::{asset_path, http_get, DataMsg, Source};
+use super::{DataMsg, Source, asset_path, http_get};
 
 pub struct WindGrid {
     pub w: u32,
@@ -226,4 +226,32 @@ pub fn run(tx: Sender<DataMsg>) {
 #[allow(unused)]
 fn _keep(t: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
     t.duration_round(chrono::Duration::hours(1)).unwrap_or(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use half::f16;
+
+    #[test]
+    fn vendored_snapshot_decodes_to_sane_wind() {
+        let g = super::load_snapshot().expect("snapshot decodes");
+        assert_eq!((g.w, g.h), (1440, 721));
+        assert_eq!(g.data.len(), 1440 * 721);
+        assert!(g.label.starts_with("GFS"));
+
+        let mean_abs_u = |lat: f64| -> f32 {
+            let row = (((90.0 - lat) / 180.0) * 720.0).round() as usize;
+            let sum: f32 = (0..1440)
+                .map(|c| f16::from_bits(g.data[row * 1440 + c][0]).to_f32().abs())
+                .sum();
+            sum / 1440.0
+        };
+        // Southern-ocean westerlies are a permanent feature of Earth.
+        assert!(mean_abs_u(-50.0) > 2.0, "50S winds implausibly calm");
+        // All values finite (decode sanitizes NaN to 0).
+        for px in g.data.iter().step_by(9973) {
+            assert!(f16::from_bits(px[0]).to_f32().is_finite());
+            assert!(f16::from_bits(px[1]).to_f32().is_finite());
+        }
+    }
 }

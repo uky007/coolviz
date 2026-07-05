@@ -1,7 +1,7 @@
 //! Fullscreen raytraced globe + starfield pass, with the runtime land mask
 //! and the live Himawari-9 cloud disk.
 
-use super::{sampler_entry, texture_entry, uniform_entry, DEPTH_FORMAT, HDR_FORMAT};
+use super::{DEPTH_FORMAT, HDR_FORMAT, sampler_entry, texture_entry, uniform_entry};
 
 pub struct GlobePass {
     pipeline: wgpu::RenderPipeline,
@@ -130,7 +130,13 @@ impl GlobePass {
 
         let cloud_view = cloud_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = Self::make_bg(
-            device, &bgl, globals, &land_view, wrap_samp, &cloud_view, clamp_samp,
+            device,
+            &bgl,
+            globals,
+            &land_view,
+            wrap_samp,
+            &cloud_view,
+            clamp_samp,
         );
 
         Self {
@@ -182,6 +188,7 @@ impl GlobePass {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_clouds(
         &mut self,
         device: &wgpu::Device,
@@ -216,7 +223,9 @@ impl GlobePass {
                 depth_or_array_layers: 1,
             },
         );
-        let cloud_view = self.cloud_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let cloud_view = self
+            .cloud_tex
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.bind_group = Self::make_bg(
             device,
             &self.bgl,

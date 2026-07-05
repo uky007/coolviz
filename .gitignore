@@ -1,4 +1,6 @@
 /target
 /.cache
+/.claude
 *.png
 !docs/*.png
+*.mp4

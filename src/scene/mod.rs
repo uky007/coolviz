@@ -235,11 +235,7 @@ impl Scene {
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, size: (u32, u32)) {
-        if self
-            .targets
-            .as_ref()
-            .is_some_and(|t| t.size == size)
-        {
+        if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
         let (w, h) = (size.0.max(8), size.1.max(8));
@@ -312,13 +308,19 @@ impl Scene {
             ),
         ];
         let mut down_bgs = Vec::new();
-        down_bgs.push(self.post.make_sample_bg(device, &comp_view, &self.clamp_samp));
-        for m in 0..(BLOOM_MIPS - 1) as usize {
-            down_bgs.push(self.post.make_sample_bg(device, &bloom_views[m], &self.clamp_samp));
+        down_bgs.push(
+            self.post
+                .make_sample_bg(device, &comp_view, &self.clamp_samp),
+        );
+        for view in &bloom_views[..(BLOOM_MIPS - 1) as usize] {
+            down_bgs.push(self.post.make_sample_bg(device, view, &self.clamp_samp));
         }
         let mut up_bgs = Vec::new();
         for m in (1..BLOOM_MIPS as usize).rev() {
-            up_bgs.push(self.post.make_sample_bg(device, &bloom_views[m], &self.clamp_samp));
+            up_bgs.push(
+                self.post
+                    .make_sample_bg(device, &bloom_views[m], &self.clamp_samp),
+            );
         }
         let tone_bg = self.post.make_tone_bg(
             device,
@@ -368,12 +370,7 @@ impl Scene {
             ],
             params: [f.trail_gain, f.sat_dt, f.exposure, f.res_scale],
             layers: f.layers,
-            layers2: [
-                f.clouds,
-                if self.have_clouds { 1.0 } else { 0.0 },
-                0.0,
-                0.0,
-            ],
+            layers2: [f.clouds, if self.have_clouds { 1.0 } else { 0.0 }, 0.0, 0.0],
         };
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&g));
         self.particles
@@ -509,11 +506,11 @@ impl Scene {
         }
 
         // 6. Bloom chain.
-        for m in 0..BLOOM_MIPS as usize {
+        for (view, bg) in t.bloom_views.iter().zip(&t.down_bgs) {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("bloom-down"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.bloom_views[m],
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -526,7 +523,7 @@ impl Scene {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.post.record_down(&mut rp, &t.down_bgs[m]);
+            self.post.record_down(&mut rp, bg);
         }
         for (i, m) in (0..(BLOOM_MIPS as usize - 1)).rev().enumerate() {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {

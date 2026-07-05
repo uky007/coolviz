@@ -10,10 +10,9 @@ use rayon::prelude::*;
 
 use crate::astro;
 
-use super::{asset_path, cache_path, http_get, read_gz, DataMsg, SatGpu, Source};
+use super::{DataMsg, SatGpu, Source, asset_path, cache_path, http_get, read_gz};
 
-const CELESTRAK_URL: &str =
-    "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json";
+const CELESTRAK_URL: &str = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=json";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(2 * 3600); // CelesTrak policy
 
 struct Entry {
@@ -67,11 +66,11 @@ fn load_element_bytes(prefer_offline: bool) -> (Vec<u8>, Source) {
         .and_then(|m| m.elapsed().ok())
         .is_some_and(|age| age < CACHE_MAX_AGE);
 
-    if cache_fresh || prefer_offline {
-        if let Ok(bytes) = std::fs::read(&cache) {
-            log::info!("satellites: using cached catalog");
-            return (bytes, Source::Cache);
-        }
+    if (cache_fresh || prefer_offline)
+        && let Ok(bytes) = std::fs::read(&cache)
+    {
+        log::info!("satellites: using cached catalog");
+        return (bytes, Source::Cache);
     }
     // A freshly-vendored snapshot is as good as a live fetch; respect
     // CelesTrak's one-download-per-2h policy and skip the request.
@@ -81,11 +80,12 @@ fn load_element_bytes(prefer_offline: bool) -> (Vec<u8>, Source) {
         .ok()
         .and_then(|m| m.elapsed().ok())
         .is_some_and(|age| age < CACHE_MAX_AGE);
-    if snap_fresh && !prefer_offline {
-        if let Ok(bytes) = read_gz(&snap) {
-            log::info!("satellites: snapshot is fresh; skipping live fetch");
-            return (bytes, Source::Snapshot);
-        }
+    if snap_fresh
+        && !prefer_offline
+        && let Ok(bytes) = read_gz(&snap)
+    {
+        log::info!("satellites: snapshot is fresh; skipping live fetch");
+        return (bytes, Source::Snapshot);
     }
     if !prefer_offline {
         match http_get(CELESTRAK_URL, 90) {
@@ -154,7 +154,10 @@ pub fn propagate_all(set: &SatSet, t: DateTime<Utc>) -> Vec<SatGpu> {
         .par_iter()
         .filter_map(|s| {
             let minutes = (naive - s.epoch).num_milliseconds() as f64 / 60_000.0;
-            let p = s.constants.propagate(sgp4::MinutesSinceEpoch(minutes)).ok()?;
+            let p = s
+                .constants
+                .propagate(sgp4::MinutesSinceEpoch(minutes))
+                .ok()?;
             let r_teme = DVec3::new(p.position[0], p.position[1], p.position[2]);
             let v_teme = DVec3::new(p.velocity[0], p.velocity[1], p.velocity[2]);
             let r_km = r_teme.length();
@@ -178,7 +181,12 @@ pub fn offline_states() -> (Vec<SatGpu>, f64, String, Source) {
     let set = build_set(true);
     let t = Utc::now();
     let states = propagate_all(&set, t);
-    (states, astro::unix_seconds(t), set.label.clone(), set.source)
+    (
+        states,
+        astro::unix_seconds(t),
+        set.label.clone(),
+        set.source,
+    )
 }
 
 pub fn run(tx: Sender<DataMsg>) {
@@ -216,5 +224,24 @@ pub fn run(tx: Sender<DataMsg>) {
         }
 
         std::thread::sleep(Duration::from_millis(1500));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{asset_path, read_gz};
+
+    #[test]
+    fn vendored_catalog_parses_and_classifies() {
+        let bytes = read_gz(&asset_path("sats_snapshot.json.gz")).expect("snapshot readable");
+        let els = super::parse_elements(&bytes).expect("catalog parses");
+        assert!(els.len() > 10_000, "only {} elements", els.len());
+        let iss = els
+            .iter()
+            .find(|e| e.norad_id == 25544)
+            .expect("ISS in catalog");
+        assert_eq!(super::classify(iss), 4);
+        // A GEO bird should classify as 2: look for mean motion ~1 rev/day.
+        assert!(els.iter().any(|e| super::classify(e) == 2));
     }
 }

@@ -41,7 +41,8 @@ cargo run --release
 
 ## ヘッドレスレンダリング
 
-ウィンドウ無しで数百フレーム分シミュレートして PNG を保存（開発・共有用）：
+ウィンドウ無しで数百フレーム分シミュレートして PNG を保存（開発・共有用）。
+※「ヘッドレス」＝ウィンドウ不要という意味で、**GPU 自体は必要**です（macOS なら Metal）。GPU の無い CI・サーバでは `no GPU adapter` で終了します：
 
 ```sh
 cargo run --release -- --shot out.png --frames 240 --size 1920x1080 \
@@ -60,12 +61,12 @@ ffmpeg -framerate 30 -i frames/%04d.png -c:v libx264 -pix_fmt yuv420p -crf 18 co
 | データ | 出典 | 備考 |
 |---|---|---|
 | 風 (10m u/v) | [NOAA NOMADS](https://nomads.ncep.noaa.gov) GFS 0.25° | GRIB filter で数百KBに絞って取得、15分毎に新サイクル確認 |
-| 雲 | [NICT ひまわりリアルタイムWeb](https://himawari8.nict.go.jp) (Himawari-9) | **非商用利用のみ**。10分毎、失敗時はキャッシュ |
+| 雲 | [NICT ひまわりリアルタイムWeb](https://himawari8.nict.go.jp) (Himawari-9) | **非商用利用のみ**。latest.json を3分毎に確認し、新画像のときだけタイル取得（元データは10分毎）。失敗時はキャッシュ |
 | 衛星軌道 | [CelesTrak](https://celestrak.org) GP (GROUP=active) | **2時間キャッシュ厳守**（先方ポリシー）。fallback は同梱スナップショット |
 | 地震 | [USGS](https://earthquake.usgs.gov) 2.5_day GeoJSON | 5分毎 |
 | 海岸線・陸地 | [Natural Earth](https://www.naturalearthdata.com) 50m/110m | パブリックドメイン、`assets/` に同梱 |
 
-コードは MIT ライセンス。`assets/` の風・衛星スナップショットは上記出典の再配布物（デモ・オフライン起動用）。
+**ライセンス**：コードは MIT（[LICENSE](LICENSE)）。データスナップショットとスクリーンショットの出所・条件は [NOTICE.md](NOTICE.md) を参照。特に `docs/hero.png` と `docs/typhoon.png` はひまわり9号画像（NICT・**非商用限定**）を含むため MIT の対象外です。
 
 ## 構成
 

@@ -1,15 +1,18 @@
-//! Himawari-9 live full-disk imagery (NICT). Fetches the 4x4 tile mosaic
-//! (2200x2200) every 10 minutes; cached to disk for offline boots.
+//! Himawari-9 live full-disk imagery (NICT). Polls `latest.json` (cheap)
+//! every few minutes and downloads the 4x4 tile mosaic (2200x2200) only when
+//! a new image timestamp appears (the source updates every 10 minutes).
+//! Cached to disk for offline boots.
 //! Imagery courtesy of NICT — non-commercial use.
 
 use std::sync::mpsc::Sender;
 
 use anyhow::Context;
 
-use super::{cache_path, http_get, DataMsg};
+use super::{DataMsg, cache_path, http_get};
 
 const LEVEL: u32 = 4; // 4x4 tiles of 550px = 2200x2200
 const TILE: u32 = 550;
+const POLL_SECS: u64 = 180;
 
 pub struct CloudImage {
     pub w: u32,
@@ -22,13 +25,11 @@ fn latest_timestamp() -> anyhow::Result<String> {
     let bytes = http_get("https://himawari8.nict.go.jp/img/D531106/latest.json", 30)?;
     let v: serde_json::Value = serde_json::from_slice(&bytes)?;
     let date = v["date"].as_str().context("no date in latest.json")?;
+    anyhow::ensure!(date.len() >= 19, "unexpected timestamp: {date}");
     Ok(date.to_string()) // "2026-07-05 05:40:00"
 }
 
-fn fetch_disk() -> anyhow::Result<CloudImage> {
-    let ts = latest_timestamp()?;
-    // "YYYY-MM-DD HH:MM:SS" -> path parts
-    anyhow::ensure!(ts.len() >= 19, "unexpected timestamp: {ts}");
+fn fetch_tiles(ts: &str) -> anyhow::Result<CloudImage> {
     let (date, time) = (&ts[0..10], &ts[11..19]);
     let ymd: Vec<&str> = date.split('-').collect();
     let hms: String = time.chars().filter(|c| *c != ':').collect();
@@ -46,7 +47,10 @@ fn fetch_disk() -> anyhow::Result<CloudImage> {
             let tile = image::load_from_memory(&png)
                 .with_context(|| format!("decode tile {tx},{ty}"))?
                 .to_rgb8();
-            anyhow::ensure!(tile.width() == TILE && tile.height() == TILE, "bad tile size");
+            anyhow::ensure!(
+                tile.width() == TILE && tile.height() == TILE,
+                "bad tile size"
+            );
             for row in 0..TILE {
                 for col in 0..TILE {
                     let p = tile.get_pixel(col, row);
@@ -73,29 +77,35 @@ fn cache_files() -> (std::path::PathBuf, std::path::PathBuf) {
     (cache_path("himawari.png"), cache_path("himawari.txt"))
 }
 
-fn save_cache(img: &CloudImage) {
+fn save_cache(img: &CloudImage, ts: &str) {
     let (png, txt) = cache_files();
-    let buf: Option<image::RgbaImage> =
-        image::RgbaImage::from_raw(img.w, img.h, img.rgba.clone());
+    let buf: Option<image::RgbaImage> = image::RgbaImage::from_raw(img.w, img.h, img.rgba.clone());
     if let Some(buf) = buf {
         if let Err(e) = buf.save(&png) {
             log::warn!("himawari cache save failed: {e}");
             return;
         }
-        std::fs::write(&txt, &img.label).ok();
+        std::fs::write(&txt, format!("{ts}\n{}", img.label)).ok();
     }
 }
 
-fn load_cache() -> Option<CloudImage> {
+/// Returns the cached image plus the timestamp it was taken at.
+fn load_cache() -> Option<(CloudImage, String)> {
     let (png, txt) = cache_files();
-    let label = std::fs::read_to_string(&txt).ok()?;
+    let meta = std::fs::read_to_string(&txt).ok()?;
+    let mut lines = meta.lines();
+    let ts = lines.next()?.to_string();
+    let label = lines.next().unwrap_or("Himawari-9").to_string();
     let img = image::open(&png).ok()?.to_rgba8();
-    Some(CloudImage {
-        w: img.width(),
-        h: img.height(),
-        rgba: img.into_raw(),
-        label: format!("{label} (cache)"),
-    })
+    Some((
+        CloudImage {
+            w: img.width(),
+            h: img.height(),
+            rgba: img.into_raw(),
+            label: format!("{label} (cache)"),
+        },
+        ts,
+    ))
 }
 
 fn send(tx: &Sender<DataMsg>, c: CloudImage) -> bool {
@@ -109,44 +119,44 @@ fn send(tx: &Sender<DataMsg>, c: CloudImage) -> bool {
 }
 
 pub fn run(tx: Sender<DataMsg>) {
-    if let Some(c) = load_cache() {
+    let mut loaded_ts = String::new();
+    if let Some((c, ts)) = load_cache() {
         log::info!("himawari: cached image {}", c.label);
+        loaded_ts = ts;
         if !send(&tx, c) {
             return;
         }
     }
-    let mut last_label = String::new();
     loop {
-        match fetch_disk() {
-            Ok(c) => {
-                if c.label != last_label {
-                    last_label = c.label.clone();
+        match latest_timestamp() {
+            Ok(ts) if ts != loaded_ts => match fetch_tiles(&ts) {
+                Ok(c) => {
                     log::info!("himawari: fetched {}", c.label);
-                    save_cache(&c);
+                    save_cache(&c, &ts);
+                    loaded_ts = ts;
                     if !send(&tx, c) {
                         return;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_secs(300));
-            }
-            Err(e) => {
-                log::warn!("himawari fetch failed: {e:#}");
-                std::thread::sleep(std::time::Duration::from_secs(120));
-            }
+                Err(e) => log::warn!("himawari tile fetch failed: {e:#}"),
+            },
+            Ok(_) => {} // no new image yet
+            Err(e) => log::warn!("himawari latest.json failed: {e:#}"),
         }
+        std::thread::sleep(std::time::Duration::from_secs(POLL_SECS));
     }
 }
 
 /// One-shot fetch for headless screenshots (falls back to cache).
 pub fn fetch_once() -> Option<CloudImage> {
-    match fetch_disk() {
-        Ok(c) => {
-            save_cache(&c);
+    match latest_timestamp().and_then(|ts| fetch_tiles(&ts).map(|c| (c, ts))) {
+        Ok((c, ts)) => {
+            save_cache(&c, &ts);
             Some(c)
         }
         Err(e) => {
             log::warn!("himawari one-shot failed ({e}), trying cache");
-            load_cache()
+            load_cache().map(|(c, _)| c)
         }
     }
 }

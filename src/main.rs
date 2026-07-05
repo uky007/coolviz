@@ -30,6 +30,23 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Parse the next CLI value as f32, rejecting non-finite input and clamping
+/// to a sane range; falls back to `cur` when absent or invalid.
+fn parse_f32(args: &mut impl Iterator<Item = String>, cur: f32, lo: f32, hi: f32) -> f32 {
+    args.next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(lo, hi))
+        .unwrap_or(cur)
+}
+
+fn parse_u32(args: &mut impl Iterator<Item = String>, cur: u32, lo: u32, hi: u32) -> u32 {
+    args.next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|v| v.clamp(lo, hi))
+        .unwrap_or(cur)
+}
+
 fn load_assets() -> anyhow::Result<SceneAssets> {
     let t0 = Instant::now();
     let (coast_vertices, coast_indices) = data::coast::load()?;
@@ -164,15 +181,12 @@ impl App {
                     source,
                 } => {
                     let n = states.len();
-                    self.iss = states
-                        .iter()
-                        .find(|s| s.pos[3] as u32 == 4)
-                        .map(|s| {
-                            (
-                                [s.pos[0], s.pos[1], s.pos[2]],
-                                [s.vel[0], s.vel[1], s.vel[2]],
-                            )
-                        });
+                    self.iss = states.iter().find(|s| s.pos[3] as u32 == 4).map(|s| {
+                        (
+                            [s.pos[0], s.pos[1], s.pos[2]],
+                            [s.vel[0], s.vel[1], s.vel[2]],
+                        )
+                    });
                     self.scene
                         .upload_sats(&rs.device, &rs.queue, bytemuck::cast_slice(&states));
                     self.sat_t0_unix = Some(t0_unix);
@@ -254,16 +268,32 @@ impl App {
                 ui.separator();
 
                 match &self.status.wind {
-                    Some((src, label)) => {
-                        status_row(ui, "WIND", source_color(*src), format!("{label} · {}", src.tag()))
-                    }
-                    None => status_row(ui, "WIND", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                    Some((src, label)) => status_row(
+                        ui,
+                        "WIND",
+                        source_color(*src),
+                        format!("{label} · {}", src.tag()),
+                    ),
+                    None => status_row(
+                        ui,
+                        "WIND",
+                        egui::Color32::from_rgb(255, 90, 90),
+                        "waiting…".into(),
+                    ),
                 }
                 match &self.status.sats {
-                    Some((src, label, _n)) => {
-                        status_row(ui, "SATS", source_color(*src), format!("{label} · {}", src.tag()))
-                    }
-                    None => status_row(ui, "SATS", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                    Some((src, label, _n)) => status_row(
+                        ui,
+                        "SATS",
+                        source_color(*src),
+                        format!("{label} · {}", src.tag()),
+                    ),
+                    None => status_row(
+                        ui,
+                        "SATS",
+                        egui::Color32::from_rgb(255, 90, 90),
+                        "waiting…".into(),
+                    ),
                 }
                 match &self.status.quakes {
                     Some((label, _n)) => status_row(
@@ -272,7 +302,12 @@ impl App {
                         egui::Color32::from_rgb(255, 150, 70),
                         label.clone(),
                     ),
-                    None => status_row(ui, "QUAKES", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                    None => status_row(
+                        ui,
+                        "QUAKES",
+                        egui::Color32::from_rgb(255, 90, 90),
+                        "waiting…".into(),
+                    ),
                 }
                 match &self.status.clouds {
                     Some(label) => {
@@ -283,7 +318,12 @@ impl App {
                         };
                         status_row(ui, "CLOUDS", c, label.clone());
                     }
-                    None => status_row(ui, "CLOUDS", egui::Color32::from_rgb(255, 90, 90), "waiting…".into()),
+                    None => status_row(
+                        ui,
+                        "CLOUDS",
+                        egui::Color32::from_rgb(255, 90, 90),
+                        "waiting…".into(),
+                    ),
                 }
                 ui.separator();
 
@@ -320,9 +360,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(format!(
                         "{:>5.1} fps · {} particles · {} sats",
-                        self.fps,
-                        self.scene.particles.count,
-                        self.scene.sats.count,
+                        self.fps, self.scene.particles.count, self.scene.sats.count,
                     ))
                     .monospace()
                     .size(11.0)
@@ -432,39 +470,38 @@ impl eframe::App for App {
         }
 
         // ISS marker + label, projected and occlusion-tested on the CPU.
-        if self.show_sats && self.show_hud {
-            if let Some((p, v)) = self.iss {
-                let wp = glam::Vec3::from(p) + glam::Vec3::from(v) * fi.sat_dt;
-                let cam = fi.cam_pos;
-                let to = wp - cam;
-                let dist = to.length();
-                let dir = to / dist.max(1e-6);
-                let t_close = -cam.dot(dir);
-                let hidden = t_close > 0.0
-                    && t_close < dist
-                    && (cam + dir * t_close).length() < 0.995;
-                if !hidden {
-                    let clip = fi.view_proj * wp.extend(1.0);
-                    if clip.w > 0.0 {
-                        let ndc = clip.truncate() / clip.w;
-                        if ndc.x.abs() < 1.05 && ndc.y.abs() < 1.05 {
-                            let sp = egui::pos2(
-                                rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
-                                rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
-                            );
-                            let c = egui::Color32::from_rgb(215, 246, 255);
-                            let painter = ui.painter();
-                            painter.circle_stroke(sp, 7.0, egui::Stroke::new(1.2, c));
-                            let alt_km = (wp.length() - 1.0) * 6371.0;
-                            let spd = glam::Vec3::from(v).length() * 6371.0;
-                            painter.text(
-                                sp + egui::vec2(11.0, -11.0),
-                                egui::Align2::LEFT_BOTTOM,
-                                format!("ISS · {alt_km:.0} km · {spd:.2} km/s"),
-                                egui::FontId::monospace(11.0),
-                                c,
-                            );
-                        }
+        if self.show_sats
+            && self.show_hud
+            && let Some((p, v)) = self.iss
+        {
+            let wp = glam::Vec3::from(p) + glam::Vec3::from(v) * fi.sat_dt;
+            let cam = fi.cam_pos;
+            let to = wp - cam;
+            let dist = to.length();
+            let dir = to / dist.max(1e-6);
+            let t_close = -cam.dot(dir);
+            let hidden = t_close > 0.0 && t_close < dist && (cam + dir * t_close).length() < 0.995;
+            if !hidden {
+                let clip = fi.view_proj * wp.extend(1.0);
+                if clip.w > 0.0 {
+                    let ndc = clip.truncate() / clip.w;
+                    if ndc.x.abs() < 1.05 && ndc.y.abs() < 1.05 {
+                        let sp = egui::pos2(
+                            rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+                            rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
+                        );
+                        let c = egui::Color32::from_rgb(215, 246, 255);
+                        let painter = ui.painter();
+                        painter.circle_stroke(sp, 7.0, egui::Stroke::new(1.2, c));
+                        let alt_km = (wp.length() - 1.0) * 6371.0;
+                        let spd = glam::Vec3::from(v).length() * 6371.0;
+                        painter.text(
+                            sp + egui::vec2(11.0, -11.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("ISS · {alt_km:.0} km · {spd:.2} km/s"),
+                            egui::FontId::monospace(11.0),
+                            c,
+                        );
                     }
                 }
             }
@@ -506,6 +543,9 @@ struct ShotOpts {
     framedump: Option<PathBuf>,
     spin: f32,
     warmup: u32,
+    /// Camera distance multiplier per second (1.0 = hold, <1 = push in).
+    dzoom: f32,
+    trail_fade: f32,
 }
 
 fn read_final(
@@ -622,6 +662,7 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
     let dt = 1.0 / 60.0;
     for i in 0..total {
         cam.lon += o.spin * dt;
+        cam.dist *= o.dzoom.powf(dt);
         cam.update(dt, (0.0, 0.0), 0.0, 1.0, o.size.1 as f32);
         let aspect = o.size.0 as f32 / o.size.1 as f32;
         let (vp, ivp, eye) = cam.matrices(aspect);
@@ -641,15 +682,15 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
             clouds: 1.0,
             sim_dt: dt,
             warp: 6000.0,
-            trail_fade: 0.958,
+            trail_fade: o.trail_fade,
             frame_index: i,
         };
         scene.render(&device, &queue, o.size, &fi);
-        if let Some(dir) = &o.framedump {
-            if i >= o.warmup {
-                let img = read_final(&device, &queue, &scene, o.size.0, o.size.1)?;
-                img.save(dir.join(format!("{:04}.png", i - o.warmup)))?;
-            }
+        if let Some(dir) = &o.framedump
+            && i >= o.warmup
+        {
+            let img = read_final(&device, &queue, &scene, o.size.0, o.size.1)?;
+            img.save(dir.join(format!("{:04}.png", i - o.warmup)))?;
         }
     }
 
@@ -675,6 +716,8 @@ fn main() -> anyhow::Result<()> {
     let mut framedump: Option<PathBuf> = None;
     let mut spin = 0.0f32;
     let mut warmup = 150u32;
+    let mut dzoom = 1.0f32;
+    let mut trail_fade = 0.958f32;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -684,22 +727,23 @@ fn main() -> anyhow::Result<()> {
                     args.next().unwrap_or_else(|| "shot.png".into()),
                 ))
             }
-            "--frames" => frames = args.next().and_then(|s| s.parse().ok()).unwrap_or(frames),
+            "--frames" => frames = parse_u32(&mut args, frames, 1, 20_000),
             "--size" => {
-                if let Some(s) = args.next() {
-                    if let Some((a, b)) = s.split_once('x') {
-                        if let (Ok(a), Ok(b)) = (a.parse(), b.parse()) {
-                            size = (a, b);
-                        }
-                    }
+                if let Some(s) = args.next()
+                    && let Some((a, b)) = s.split_once('x')
+                    && let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>())
+                {
+                    size = (a.clamp(16, 4096), b.clamp(16, 4096));
                 }
             }
-            "--lat" => lat = args.next().and_then(|s| s.parse().ok()).unwrap_or(lat),
-            "--lon" => lon = args.next().and_then(|s| s.parse().ok()).unwrap_or(lon),
-            "--dist" => dist = args.next().and_then(|s| s.parse().ok()).unwrap_or(dist),
+            "--lat" => lat = parse_f32(&mut args, lat, -88.0, 88.0),
+            "--lon" => lon = parse_f32(&mut args, lon, -720.0, 720.0),
+            "--dist" => dist = parse_f32(&mut args, dist, 1.06, 40.0),
             "--framedump" => framedump = args.next().map(PathBuf::from),
-            "--spin" => spin = args.next().and_then(|s| s.parse().ok()).unwrap_or(spin),
-            "--warmup" => warmup = args.next().and_then(|s| s.parse().ok()).unwrap_or(warmup),
+            "--spin" => spin = parse_f32(&mut args, spin, -90.0, 90.0),
+            "--warmup" => warmup = parse_u32(&mut args, warmup, 0, 5_000),
+            "--dzoom" => dzoom = parse_f32(&mut args, dzoom, 0.5, 1.5),
+            "--trailfade" => trail_fade = parse_f32(&mut args, trail_fade, 0.5, 0.998),
             other => log::warn!("unknown arg: {other}"),
         }
     }
@@ -718,6 +762,8 @@ fn main() -> anyhow::Result<()> {
                 framedump,
                 spin,
                 warmup,
+                dzoom,
+                trail_fade,
             },
             assets,
         );
@@ -737,4 +783,27 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| Ok(Box::new(App::new(cc, assets)))),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_f32, parse_u32};
+
+    #[test]
+    fn cli_values_are_clamped_and_nan_rejected() {
+        let mut it = vec!["NaN".to_string()].into_iter();
+        assert_eq!(parse_f32(&mut it, 3.3, 1.06, 40.0), 3.3);
+
+        let mut it = vec!["-5".to_string()].into_iter();
+        assert_eq!(parse_f32(&mut it, 1.0, 0.5, 1.5), 0.5);
+
+        let mut it = vec!["9999999".to_string()].into_iter();
+        assert_eq!(parse_u32(&mut it, 240, 1, 20_000), 20_000);
+
+        let mut it = std::iter::empty::<String>();
+        assert_eq!(parse_u32(&mut it, 7, 1, 10), 7);
+
+        let mut it = vec!["abc".to_string()].into_iter();
+        assert_eq!(parse_f32(&mut it, 2.0, 0.0, 4.0), 2.0);
+    }
 }

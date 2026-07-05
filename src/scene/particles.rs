@@ -4,8 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use super::{
-    depth_test_no_write, sampler_entry, storage_entry, texture_entry, uniform_entry,
-    ADDITIVE_BLEND, HDR_FORMAT,
+    ADDITIVE_BLEND, HDR_FORMAT, depth_test_no_write, sampler_entry, storage_entry, texture_entry,
+    uniform_entry,
 };
 
 #[repr(C)]
@@ -54,7 +54,10 @@ fn init_particles(n: u32) -> Vec<ParticleCpu> {
     (0..n)
         .map(|_| {
             let lon = rng.f32() * 360.0 - 180.0;
-            let lat = (rng.f32() * 2.0 - 1.0).clamp(-0.999, 0.999).asin().to_degrees();
+            let lat = (rng.f32() * 2.0 - 1.0)
+                .clamp(-0.999, 0.999)
+                .asin()
+                .to_degrees();
             let life = 4.0 + 9.0 * rng.f32();
             ParticleCpu {
                 cur: [lon, lat],
@@ -444,7 +447,12 @@ impl ParticlePass {
         fade: f32,
     ) {
         let p = SimParams {
-            v0: [dt, warp, self.count as f32, (frame_index % 1_000_000) as f32],
+            v0: [
+                dt,
+                warp,
+                self.count as f32,
+                (frame_index % 1_000_000) as f32,
+            ],
         };
         queue.write_buffer(&self.sim_params, 0, bytemuck::bytes_of(&p));
         let fp = FadeParams {

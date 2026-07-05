@@ -1,7 +1,7 @@
 //! Generic storage-buffer-driven billboard sprite pass (satellites, quakes).
 //! Instances are pairs of vec4s; the shader decides what they mean.
 
-use super::{depth_test_no_write, storage_entry, uniform_entry, ADDITIVE_BLEND, HDR_FORMAT};
+use super::{ADDITIVE_BLEND, HDR_FORMAT, depth_test_no_write, storage_entry, uniform_entry};
 
 pub struct SpritePass {
     pipeline: wgpu::RenderPipeline,

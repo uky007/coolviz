@@ -2,10 +2,9 @@
 
 use std::sync::mpsc::Sender;
 
-use super::{http_get, DataMsg, QuakeCpu};
+use super::{DataMsg, QuakeCpu, http_get};
 
-const URL: &str =
-    "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+const URL: &str = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
 
 pub fn fetch_once() -> anyhow::Result<(Vec<QuakeCpu>, String)> {
     let bytes = http_get(URL, 30)?;

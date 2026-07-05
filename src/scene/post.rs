@@ -1,6 +1,8 @@
 //! Post-processing: composite, bloom pyramid, tonemap.
 
-use super::{sampler_entry, texture_entry, uniform_entry, ADDITIVE_BLEND, FINAL_FORMAT, HDR_FORMAT};
+use super::{
+    ADDITIVE_BLEND, FINAL_FORMAT, HDR_FORMAT, sampler_entry, texture_entry, uniform_entry,
+};
 
 pub struct PostPass {
     comp_pipeline: wgpu::RenderPipeline,
