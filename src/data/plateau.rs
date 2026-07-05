@@ -27,12 +27,65 @@ pub struct CityTile {
     pub atlas: Vec<u8>, // ATLAS_SIZE^2 RGBA
     /// Roof-top position + hash of each building in this tile.
     pub rooftops: Vec<([f32; 3], f32)>,
+    pub buildings: Vec<BuildingInfo>,
+}
+
+/// Hoverable per-building metadata from the PLATEAU batch table.
+#[derive(Clone, Debug)]
+pub struct BuildingInfo {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub name: String,
+    pub usage: String,
+    pub address: String,
+    pub floors: i32,
+    pub floors_below: i32,
+    pub height: f32,
+}
+
+fn bt_str(bt: &serde_json::Value, key: &str, i: usize) -> String {
+    bt[key]
+        .as_array()
+        .and_then(|a| a.get(i))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Batch-table numeric value: either a JSON array entry or a binary-body ref.
+fn bt_num(bt: &serde_json::Value, bin: &[u8], key: &str, i: usize) -> Option<f64> {
+    let v = &bt[key];
+    if let Some(a) = v.as_array() {
+        let e = a.get(i)?;
+        return e
+            .as_f64()
+            .or_else(|| e.as_str().and_then(|s| s.trim().parse().ok()));
+    }
+    let off = v["byteOffset"].as_u64()? as usize;
+    match v["componentType"].as_str()? {
+        "DOUBLE" => bin
+            .get(off + i * 8..off + i * 8 + 8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap())),
+        "FLOAT" => bin
+            .get(off + i * 4..off + i * 4 + 4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64),
+        "INT" | "UNSIGNED_INT" => bin
+            .get(off + i * 4..off + i * 4 + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as f64),
+        "SHORT" | "UNSIGNED_SHORT" => bin
+            .get(off + i * 2..off + i * 2 + 2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()) as f64),
+        "BYTE" | "UNSIGNED_BYTE" => bin.get(off + i).map(|b| *b as f64),
+        _ => None,
+    }
 }
 
 pub struct CityMesh {
     pub tiles: Vec<CityTile>,
     /// Aviation obstruction beacons for tall buildings.
     pub beacons: Vec<super::LightGpu>,
+    /// Flattened hover metadata for every building.
+    pub buildings: Vec<BuildingInfo>,
     pub label: String,
 }
 
@@ -220,13 +273,23 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
         })
         .unwrap_or(DVec3::ZERO);
 
+    let bt: serde_json::Value = if btj > 0 {
+        serde_json::from_slice(&bytes[28 + ftj + ftb..28 + ftj + ftb + btj]).unwrap_or_default()
+    } else {
+        serde_json::Value::Null
+    };
+    let btbin = &bytes[28 + ftj + ftb + btj..28 + ftj + ftb + btj + btb];
+
     let mut tile = CityTile {
         verts: Vec::new(),
         indices: Vec::new(),
         atlas: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
         rooftops: Vec::new(),
+        buildings: Vec::new(),
     };
     let mut tops: std::collections::HashMap<u32, ([f32; 3], f32)> =
+        std::collections::HashMap::new();
+    let mut boxes: std::collections::HashMap<u32, ([f32; 3], [f32; 3])> =
         std::collections::HashMap::new();
     for px in tile.atlas.chunks_exact_mut(4) {
         px.copy_from_slice(&[54, 58, 66, 255]); // untextured fallback: dark facade
@@ -326,6 +389,11 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
                 if w[1] > top.0[1] {
                     top.0 = w;
                 }
+                let bx = boxes.entry(bid).or_insert((w, w));
+                for (k, &wk) in w.iter().enumerate() {
+                    bx.0[k] = bx.0[k].min(wk);
+                    bx.1[k] = bx.1[k].max(wk);
+                }
                 tile.indices.push(tile.verts.len() as u32);
                 tile.verts.push([w[0], w[1], w[2], au, av, bhash]);
             }
@@ -333,6 +401,22 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
     }
     anyhow::ensure!(!tile.verts.is_empty(), "empty tile");
     tile.rooftops = tops.into_values().collect();
+    tile.buildings = boxes
+        .into_iter()
+        .map(|(bid, (min, max))| {
+            let i = bid as usize;
+            BuildingInfo {
+                min,
+                max,
+                name: bt_str(&bt, "名称", i),
+                usage: bt_str(&bt, "用途", i),
+                address: bt_str(&bt, "住所", i),
+                floors: bt_num(&bt, btbin, "地上階数", i).unwrap_or(-1.0) as i32,
+                floors_below: bt_num(&bt, btbin, "地下階数", i).unwrap_or(0.0) as i32,
+                height: bt_num(&bt, btbin, "計測高さ", i).unwrap_or(0.0) as f32,
+            }
+        })
+        .collect();
     Ok(tile)
 }
 
@@ -422,6 +506,7 @@ pub fn load_city() -> anyhow::Result<CityMesh> {
     let mut mesh = CityMesh {
         tiles,
         beacons: Vec::new(),
+        buildings: Vec::new(),
         label: String::new(),
     };
     let mut ys: Vec<f32> = mesh
@@ -446,8 +531,19 @@ pub fn load_city() -> anyhow::Result<CityMesh> {
                 });
             }
         }
+        for b in &mut t.buildings {
+            b.min[1] -= ground;
+            b.max[1] -= ground;
+        }
+        mesh.buildings.append(&mut t.buildings);
     }
-    log::info!("plateau: {} aviation beacons", mesh.beacons.len());
+    let named = mesh.buildings.iter().filter(|b| !b.name.is_empty()).count();
+    log::info!(
+        "plateau: {} aviation beacons, {} buildings ({} named)",
+        mesh.beacons.len(),
+        mesh.buildings.len(),
+        named
+    );
 
     mesh.label = format!(
         "PLATEAU 千代田区 (photo tex) · {} tiles · {}k tris",

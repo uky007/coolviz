@@ -148,10 +148,11 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4<f32> {
     let rain = rain_level(in.world.xz, t);
     var col = vec3(0.012, 0.015, 0.020);
 
-    // Faint 100 m survey grid — mission-control floor.
+    // Very faint survey grid + block-scale tonal variation.
     let g = abs(fract(in.world.xz / 100.0 + 0.5) - 0.5) * 100.0;
     let line = 1.0 - smoothstep(0.0, 1.6, min(g.x, g.y));
-    col += vec3(0.05, 0.14, 0.20) * line * 0.16;
+    col += vec3(0.05, 0.14, 0.20) * line * 0.05;
+    col *= 0.75 + 0.5 * vnoise(in.world.xz * 0.004 + 11.0);
 
     // Wet sheen: shimmering reflection of the city, scaled by live rain.
     let sparkle = vnoise(in.world.xz * 0.9 + vec2(t * 2.0, -t * 1.7))

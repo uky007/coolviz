@@ -92,6 +92,7 @@ pub enum DataMsg {
     CityMesh {
         tiles: Vec<plateau::CityTile>,
         beacons: Vec<LightGpu>,
+        buildings: Vec<plateau::BuildingInfo>,
         label: String,
     },
     Roads {
@@ -147,6 +148,7 @@ pub fn spawn_city(tx: Sender<DataMsg>) {
                 let _ = tx.send(DataMsg::CityMesh {
                     tiles: mesh.tiles,
                     beacons: mesh.beacons,
+                    buildings: mesh.buildings,
                     label: mesh.label,
                 });
             }

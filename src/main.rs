@@ -120,6 +120,71 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Slab-method ray/AABB intersection; returns entry distance.
+fn ray_aabb(ro: glam::Vec3, rd: glam::Vec3, min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let inv = rd.recip();
+    let t0 = (glam::Vec3::from(min) - ro) * inv;
+    let t1 = (glam::Vec3::from(max) - ro) * inv;
+    let tmin = t0.min(t1).max_element();
+    let tmax = t0.max(t1).min_element();
+    if tmax >= tmin.max(0.0) {
+        Some(tmin.max(0.0))
+    } else {
+        None
+    }
+}
+
+// ---- CPU port of the Okinawa terrain (ocean.wgsl) for depth hovering ----
+
+fn oki_hash21(p: glam::Vec2) -> f32 {
+    let mut q = (p * glam::Vec2::new(123.34, 456.21)).fract();
+    q += glam::Vec2::splat(q.dot(q + glam::Vec2::splat(45.32)));
+    (q.x * q.y).fract()
+}
+
+fn oki_vnoise(p: glam::Vec2) -> f32 {
+    let i = p.floor();
+    let f = p.fract();
+    let u = f * f * (glam::Vec2::splat(3.0) - 2.0 * f);
+    let a = oki_hash21(i);
+    let b = oki_hash21(i + glam::Vec2::X);
+    let c = oki_hash21(i + glam::Vec2::Y);
+    let d = oki_hash21(i + glam::Vec2::ONE);
+    lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y)
+}
+
+fn oki_fbm(p: glam::Vec2) -> f32 {
+    let m = glam::Mat2::from_cols_array(&[1.6, -1.2, 1.2, 1.6]);
+    let (mut v, mut a, mut q) = (0.0, 0.5, p);
+    for _ in 0..4 {
+        v += a * oki_vnoise(q);
+        q = m * q;
+        a *= 0.5;
+    }
+    v
+}
+
+fn oki_terrain(xz: glam::Vec2) -> f32 {
+    let island = glam::Vec2::new(-330.0, -400.0);
+    let rr = xz.distance(island) + (oki_fbm(xz * 0.004) - 0.5) * 70.0;
+    let smooth = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let mut h = 30.0 * smooth(430.0, 60.0, rr)
+        + (430.0 - rr) * 0.045
+        + 4.0 * (oki_fbm(xz * 0.02) - 0.5) * smooth(400.0, 200.0, rr);
+    h = h.min(34.0);
+    let lagoon = -1.0 - 2.4 * smooth(430.0, 900.0, rr);
+    h = h.min(lagoon.max((430.0 - rr) * 0.045));
+    let coral_n = oki_vnoise(xz * 0.05 + 31.7) * 0.65 + oki_vnoise(xz * 0.15 + 7.1) * 0.35;
+    let coral = smooth(0.58, 0.66, coral_n) * smooth(500.0, 590.0, rr) * smooth(980.0, 880.0, rr);
+    h += coral * (1.4 + 0.6 * oki_vnoise(xz * 0.3));
+    h += 2.4 * (-((rr - 940.0) / 55.0).powi(2)).exp();
+    h -= 44.0 * smooth(955.0, 1250.0, rr);
+    h
+}
+
 /// Parse the next CLI value as f32, rejecting non-finite input and clamping
 /// to a sane range; falls back to `cur` when absent or invalid.
 fn parse_f32(args: &mut impl Iterator<Item = String>, cur: f32, lo: f32, hi: f32) -> f32 {
@@ -213,6 +278,8 @@ struct App {
     cars: Option<CarSim>,
     lamp_lights: Vec<LightGpu>,
     beacon_lights: Vec<LightGpu>,
+    buildings: Vec<data::plateau::BuildingInfo>,
+    rain_grid: Option<(u32, Vec<u8>, [f64; 4])>,
     tex: Option<(egui::TextureId, (u32, u32))>,
     // UI state
     show_wind: bool,
@@ -278,6 +345,8 @@ impl App {
             cars: None,
             lamp_lights: Vec::new(),
             beacon_lights: Vec::new(),
+            buildings: Vec::new(),
+            rain_grid: None,
             tex: None,
             show_wind: true,
             show_sats: true,
@@ -343,10 +412,12 @@ impl App {
                 DataMsg::CityMesh {
                     tiles,
                     beacons,
+                    buildings,
                     label,
                 } => {
                     self.scene.upload_city(&rs.device, &rs.queue, &tiles);
                     self.beacon_lights = beacons;
+                    self.buildings = buildings;
                     self.refresh_static_lights(rs);
                     self.status.city = Some(label);
                 }
@@ -371,6 +442,7 @@ impl App {
                 } => {
                     self.scene
                         .upload_rain(&rs.device, &rs.queue, size, &levels, bounds);
+                    self.rain_grid = Some((size, levels, bounds));
                     // Auto-switch to live rain the moment there is real rain.
                     if max_level > 0 {
                         self.rain_demo = false;
@@ -839,120 +911,215 @@ impl eframe::App for App {
             }
         }
 
-        // Hover inspector (Earth mode): nearest quake or satellite under the
-        // cursor, else a lat/lon + wind readout on the globe surface.
-        if self.mode == SceneMode::Earth
-            && self.show_hud
+        // Hover inspector: satellites/quakes/wind on Earth, buildings/rain in
+        // Tokyo, water depth in Okinawa.
+        if self.show_hud
             && let Some(cur) = resp.hover_pos()
         {
-            let to_screen = |w: glam::Vec3| -> Option<egui::Pos2> {
-                let clip = fi.view_proj * w.extend(1.0);
-                if clip.w <= 0.0 {
-                    return None;
-                }
-                let ndc = clip.truncate() / clip.w;
-                Some(egui::pos2(
-                    rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
-                    rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
-                ))
-            };
-            let cam = fi.cam_pos;
-            let occluded = |p: glam::Vec3| -> bool {
-                let to = p - cam;
-                let dist = to.length();
-                let dir = to / dist.max(1e-6);
-                let t_close = -cam.dot(dir);
-                t_close > 0.0 && t_close < dist && (cam + dir * t_close).length() < 0.995
-            };
             let mut lines: Vec<String> = Vec::new();
-
-            let mut best_sat: Option<usize> = None;
-            let mut best_sat_d2 = 11.0f32 * 11.0;
-            if self.show_sats {
-                for (i, s) in self.sat_states.iter().enumerate() {
-                    let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]])
-                        + glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]) * fi.sat_dt;
-                    if let Some(sp) = to_screen(wp) {
-                        let d2 = sp.distance_sq(cur);
-                        if d2 < best_sat_d2 && !occluded(wp) {
-                            best_sat_d2 = d2;
-                            best_sat = Some(i);
-                        }
-                    }
-                }
-            }
-            let mut best_q: Option<usize> = None;
-            let mut best_q_d2 = 14.0f32 * 14.0;
-            if self.show_quakes {
-                for (i, q) in self.quake_list.iter().enumerate() {
-                    let wp = astro::latlon_to_world(q.lat, q.lon) * 1.004;
-                    if let Some(sp) = to_screen(wp) {
-                        let d2 = sp.distance_sq(cur);
-                        if d2 < best_q_d2 && !occluded(wp) {
-                            best_q_d2 = d2;
-                            best_q = Some(i);
-                        }
-                    }
-                }
-            }
-
-            if let Some(i) = best_q {
-                let q = &self.quake_list[i];
-                let age_h = (astro::unix_seconds(Utc::now()) - q.unix_ms as f64 / 1000.0) / 3600.0;
-                lines.push(format!("M{:.1} · {}", q.mag, q.place));
-                lines.push(format!("{age_h:.1} h ago"));
-            } else if let Some(i) = best_sat {
-                let s = &self.sat_states[i];
-                let name = self
-                    .sat_idxs
-                    .get(i)
-                    .and_then(|&ix| self.sat_names.get(ix as usize))
-                    .cloned()
-                    .unwrap_or_else(|| "satellite".into());
-                let kind = match s.pos[3] as u32 {
-                    0 => "LEO",
-                    1 => "MEO",
-                    2 => "GEO",
-                    3 => "HEO",
-                    _ => "ISS",
-                };
-                let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]]);
-                let alt = (wp.length() - 1.0) * 6371.0;
-                let spd = glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]).length() * 6371.0;
-                lines.push(name);
-                lines.push(format!("{kind} · {alt:.0} km · {spd:.2} km/s"));
-            } else {
-                let ndc = glam::Vec2::new(
-                    (cur.x - rect.min.x) / rect.width() * 2.0 - 1.0,
-                    -((cur.y - rect.min.y) / rect.height() * 2.0 - 1.0),
-                );
-                let pw = fi.inv_view_proj * glam::Vec4::new(ndc.x, ndc.y, 0.6, 1.0);
-                let dir = (pw.truncate() / pw.w - cam).normalize();
-                let b = cam.dot(dir);
-                let c = cam.dot(cam) - 1.0;
-                let h2 = b * b - c;
-                if h2 > 0.0 && -b - h2.sqrt() > 0.0 {
-                    let p = cam + dir * (-b - h2.sqrt());
-                    let lat = p.y.asin().to_degrees();
-                    let lon = (-p.z).atan2(p.x).to_degrees();
-                    lines.push(format!(
-                        "{:.2}°{} {:.2}°{}",
-                        lat.abs(),
-                        if lat >= 0.0 { "N" } else { "S" },
-                        lon.abs(),
-                        if lon >= 0.0 { "E" } else { "W" },
-                    ));
-                    if self.show_wind
-                        && let Some((w, h, grid)) = &self.wind_grid
+            let ray_dir = {
+                let nx = (cur.x - rect.min.x) / rect.width() * 2.0 - 1.0;
+                let ny = -((cur.y - rect.min.y) / rect.height() * 2.0 - 1.0);
+                let pw = fi.inv_view_proj * glam::Vec4::new(nx, ny, 0.6, 1.0);
+                (pw.truncate() / pw.w - fi.cam_pos).normalize()
+            };
+            if self.mode == SceneMode::Tokyo {
+                let cam = fi.cam_pos;
+                let mut best_t = f32::MAX;
+                let mut best: Option<usize> = None;
+                for (i, b) in self.buildings.iter().enumerate() {
+                    if let Some(t) = ray_aabb(cam, ray_dir, b.min, b.max)
+                        && t < best_t
                     {
-                        let col =
-                            ((lon.rem_euclid(360.0) / 360.0) * *w as f32) as usize % *w as usize;
-                        let row = (((90.0 - lat) / 180.0) * (*h as f32 - 1.0))
-                            .clamp(0.0, *h as f32 - 1.0) as usize;
-                        let px = grid[row * *w as usize + col];
-                        let u = half::f16::from_bits(px[0]).to_f32();
-                        let v = half::f16::from_bits(px[1]).to_f32();
-                        lines.push(format!("WIND {:.1} m/s", (u * u + v * v).sqrt()));
+                        best_t = t;
+                        best = Some(i);
+                    }
+                }
+                if let Some(i) = best {
+                    let b = &self.buildings[i];
+                    lines.push(if b.name.is_empty() {
+                        "(名称データなし)".to_string()
+                    } else {
+                        b.name.clone()
+                    });
+                    let mut spec = Vec::new();
+                    if b.height > 0.0 {
+                        spec.push(format!("H {:.0}m", b.height));
+                    }
+                    if b.floors > 0 {
+                        if b.floors_below > 0 {
+                            spec.push(format!("{}F/B{}", b.floors, b.floors_below));
+                        } else {
+                            spec.push(format!("{}F", b.floors));
+                        }
+                    }
+                    if !b.usage.is_empty() {
+                        spec.push(b.usage.clone());
+                    }
+                    if !spec.is_empty() {
+                        lines.push(spec.join(" · "));
+                    }
+                    if !b.address.is_empty() {
+                        lines.push(b.address.clone());
+                    }
+                } else if ray_dir.y < -1e-4 {
+                    let t = -cam.y / ray_dir.y;
+                    let p = cam + ray_dir * t;
+                    if self.rain_demo {
+                        lines.push("rain: DEMO storm".into());
+                    } else if let Some((size, levels, bounds)) = &self.rain_grid {
+                        const MMH: [&str; 9] = [
+                            "",
+                            "<1mm/h",
+                            "1-5mm/h",
+                            "5-10mm/h",
+                            "10-20mm/h",
+                            "20-30mm/h",
+                            "30-50mm/h",
+                            "50-80mm/h",
+                            "80mm/h+",
+                        ];
+                        let m_lon = 111_320.0 * data::plateau::SITE_LAT.to_radians().cos();
+                        let lon = data::plateau::SITE_LON + p.x as f64 / m_lon;
+                        let lat = data::plateau::SITE_LAT - p.z as f64 / 111_132.0;
+                        let u = (lon - bounds[0]) / (bounds[2] - bounds[0]);
+                        let v = (bounds[1] - lat) / (bounds[1] - bounds[3]);
+                        if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
+                            let x = (u * *size as f64) as usize % *size as usize;
+                            let y = (v * *size as f64) as usize % *size as usize;
+                            let lv = levels[y * *size as usize + x] as usize;
+                            lines.push(if lv == 0 {
+                                "降雨なし (live)".to_string()
+                            } else {
+                                format!("雨 lv{lv} ({})", MMH[lv.min(8)])
+                            });
+                        }
+                    }
+                }
+            } else if self.mode == SceneMode::Okinawa {
+                if ray_dir.y < -1e-4 {
+                    let t = -fi.cam_pos.y / ray_dir.y;
+                    let p = fi.cam_pos + ray_dir * t;
+                    let h = oki_terrain(glam::Vec2::new(p.x, p.z));
+                    if h > 0.3 {
+                        lines.push(format!("陸地 · 標高 ~{h:.1} m"));
+                    } else if h > -0.05 {
+                        lines.push("波打ち際".to_string());
+                    } else {
+                        lines.push(format!("水深 ~{:.1} m", -h));
+                    }
+                }
+            } else {
+                let to_screen = |w: glam::Vec3| -> Option<egui::Pos2> {
+                    let clip = fi.view_proj * w.extend(1.0);
+                    if clip.w <= 0.0 {
+                        return None;
+                    }
+                    let ndc = clip.truncate() / clip.w;
+                    Some(egui::pos2(
+                        rect.min.x + (ndc.x * 0.5 + 0.5) * rect.width(),
+                        rect.min.y + (0.5 - ndc.y * 0.5) * rect.height(),
+                    ))
+                };
+                let cam = fi.cam_pos;
+                let occluded = |p: glam::Vec3| -> bool {
+                    let to = p - cam;
+                    let dist = to.length();
+                    let dir = to / dist.max(1e-6);
+                    let t_close = -cam.dot(dir);
+                    t_close > 0.0 && t_close < dist && (cam + dir * t_close).length() < 0.995
+                };
+
+                let mut best_sat: Option<usize> = None;
+                let mut best_sat_d2 = 11.0f32 * 11.0;
+                if self.show_sats {
+                    for (i, s) in self.sat_states.iter().enumerate() {
+                        let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]])
+                            + glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]) * fi.sat_dt;
+                        if let Some(sp) = to_screen(wp) {
+                            let d2 = sp.distance_sq(cur);
+                            if d2 < best_sat_d2 && !occluded(wp) {
+                                best_sat_d2 = d2;
+                                best_sat = Some(i);
+                            }
+                        }
+                    }
+                }
+                let mut best_q: Option<usize> = None;
+                let mut best_q_d2 = 14.0f32 * 14.0;
+                if self.show_quakes {
+                    for (i, q) in self.quake_list.iter().enumerate() {
+                        let wp = astro::latlon_to_world(q.lat, q.lon) * 1.004;
+                        if let Some(sp) = to_screen(wp) {
+                            let d2 = sp.distance_sq(cur);
+                            if d2 < best_q_d2 && !occluded(wp) {
+                                best_q_d2 = d2;
+                                best_q = Some(i);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(i) = best_q {
+                    let q = &self.quake_list[i];
+                    let age_h =
+                        (astro::unix_seconds(Utc::now()) - q.unix_ms as f64 / 1000.0) / 3600.0;
+                    lines.push(format!("M{:.1} · {}", q.mag, q.place));
+                    lines.push(format!("{age_h:.1} h ago"));
+                } else if let Some(i) = best_sat {
+                    let s = &self.sat_states[i];
+                    let name = self
+                        .sat_idxs
+                        .get(i)
+                        .and_then(|&ix| self.sat_names.get(ix as usize))
+                        .cloned()
+                        .unwrap_or_else(|| "satellite".into());
+                    let kind = match s.pos[3] as u32 {
+                        0 => "LEO",
+                        1 => "MEO",
+                        2 => "GEO",
+                        3 => "HEO",
+                        _ => "ISS",
+                    };
+                    let wp = glam::Vec3::from([s.pos[0], s.pos[1], s.pos[2]]);
+                    let alt = (wp.length() - 1.0) * 6371.0;
+                    let spd = glam::Vec3::from([s.vel[0], s.vel[1], s.vel[2]]).length() * 6371.0;
+                    lines.push(name);
+                    lines.push(format!("{kind} · {alt:.0} km · {spd:.2} km/s"));
+                } else {
+                    let ndc = glam::Vec2::new(
+                        (cur.x - rect.min.x) / rect.width() * 2.0 - 1.0,
+                        -((cur.y - rect.min.y) / rect.height() * 2.0 - 1.0),
+                    );
+                    let pw = fi.inv_view_proj * glam::Vec4::new(ndc.x, ndc.y, 0.6, 1.0);
+                    let dir = (pw.truncate() / pw.w - cam).normalize();
+                    let b = cam.dot(dir);
+                    let c = cam.dot(cam) - 1.0;
+                    let h2 = b * b - c;
+                    if h2 > 0.0 && -b - h2.sqrt() > 0.0 {
+                        let p = cam + dir * (-b - h2.sqrt());
+                        let lat = p.y.asin().to_degrees();
+                        let lon = (-p.z).atan2(p.x).to_degrees();
+                        lines.push(format!(
+                            "{:.2}°{} {:.2}°{}",
+                            lat.abs(),
+                            if lat >= 0.0 { "N" } else { "S" },
+                            lon.abs(),
+                            if lon >= 0.0 { "E" } else { "W" },
+                        ));
+                        if self.show_wind
+                            && let Some((w, h, grid)) = &self.wind_grid
+                        {
+                            let col = ((lon.rem_euclid(360.0) / 360.0) * *w as f32) as usize
+                                % *w as usize;
+                            let row = (((90.0 - lat) / 180.0) * (*h as f32 - 1.0))
+                                .clamp(0.0, *h as f32 - 1.0)
+                                as usize;
+                            let px = grid[row * *w as usize + col];
+                            let u = half::f16::from_bits(px[0]).to_f32();
+                            let v = half::f16::from_bits(px[1]).to_f32();
+                            lines.push(format!("WIND {:.1} m/s", (u * u + v * v).sqrt()));
+                        }
                     }
                 }
             }
