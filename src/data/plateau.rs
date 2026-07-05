@@ -25,10 +25,14 @@ pub struct CityTile {
     pub verts: Vec<[f32; 6]>,
     pub indices: Vec<u32>,
     pub atlas: Vec<u8>, // ATLAS_SIZE^2 RGBA
+    /// Roof-top position + hash of each building in this tile.
+    pub rooftops: Vec<([f32; 3], f32)>,
 }
 
 pub struct CityMesh {
     pub tiles: Vec<CityTile>,
+    /// Aviation obstruction beacons for tall buildings.
+    pub beacons: Vec<super::LightGpu>,
     pub label: String,
 }
 
@@ -220,7 +224,10 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
         verts: Vec::new(),
         indices: Vec::new(),
         atlas: vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize],
+        rooftops: Vec::new(),
     };
+    let mut tops: std::collections::HashMap<u32, ([f32; 3], f32)> =
+        std::collections::HashMap::new();
     for px in tile.atlas.chunks_exact_mut(4) {
         px.copy_from_slice(&[54, 58, 66, 255]); // untextured fallback: dark facade
     }
@@ -314,19 +321,18 @@ fn parse_tile(bytes: &[u8], enu: &Enu, tile_seed: u32) -> anyhow::Result<CityTil
                 let uv = uvs.as_ref().map(|u| u[i]).unwrap_or([0.5, 0.5]);
                 let au = (cx + 0.5 + uv[0].clamp(0.0, 1.0) * (CELL - 1) as f32) / ATLAS_SIZE as f32;
                 let av = (cy + 0.5 + uv[1].clamp(0.0, 1.0) * (CELL - 1) as f32) / ATLAS_SIZE as f32;
+                let bhash = hash01(bid ^ tile_seed.rotate_left(9));
+                let top = tops.entry(bid).or_insert((w, bhash));
+                if w[1] > top.0[1] {
+                    top.0 = w;
+                }
                 tile.indices.push(tile.verts.len() as u32);
-                tile.verts.push([
-                    w[0],
-                    w[1],
-                    w[2],
-                    au,
-                    av,
-                    hash01(bid ^ tile_seed.rotate_left(9)),
-                ]);
+                tile.verts.push([w[0], w[1], w[2], au, av, bhash]);
             }
         }
     }
     anyhow::ensure!(!tile.verts.is_empty(), "empty tile");
+    tile.rooftops = tops.into_values().collect();
     Ok(tile)
 }
 
@@ -415,6 +421,7 @@ pub fn load_city() -> anyhow::Result<CityMesh> {
     // Ground calibration across all tiles: 3rd percentile height -> y = 0.
     let mut mesh = CityMesh {
         tiles,
+        beacons: Vec::new(),
         label: String::new(),
     };
     let mut ys: Vec<f32> = mesh
@@ -430,7 +437,17 @@ pub fn load_city() -> anyhow::Result<CityMesh> {
             v[1] -= ground;
         }
         tris += t.indices.len() / 3;
+        for (top, hash) in &t.rooftops {
+            let h = top[1] - ground;
+            if h > 55.0 {
+                mesh.beacons.push(super::LightGpu {
+                    pos: [top[0], h + 2.0, top[2], 3.0],
+                    aux: [*hash, 0.0, 0.0, 1.0],
+                });
+            }
+        }
     }
+    log::info!("plateau: {} aviation beacons", mesh.beacons.len());
 
     mesh.label = format!(
         "PLATEAU 千代田区 (photo tex) · {} tiles · {}k tris",

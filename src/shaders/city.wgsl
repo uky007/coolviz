@@ -163,6 +163,38 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4<f32> {
     return vec4(fog_mix(col, dist, rain), 1.0);
 }
 
+// ---------------- roads ----------------
+
+struct RoadOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) klass: f32,
+};
+
+@vertex
+fn vs_road(@location(0) p: vec4<f32>) -> RoadOut {
+    return RoadOut(G.view_proj * vec4(p.xyz, 1.0), p.xyz, p.w);
+}
+
+@fragment
+fn fs_road(in: RoadOut) -> @location(0) vec4<f32> {
+    let t = G.cam_pos.w;
+    let rain = rain_level(in.world.xz, t);
+
+    // Asphalt, faintly warmed by street lighting.
+    var col = vec3(0.020, 0.021, 0.024);
+    col += vec3(0.055, 0.042, 0.024) * (1.0 - in.klass * 0.12);
+
+    // Wet road: streaky reflections of the sodium lights and windows.
+    let streak = vnoise(in.world.xz * vec2(0.5, 0.5) + vec2(t * 1.4, -t * 1.1))
+        * vnoise(in.world.xz * 0.16 + vec2(-t * 0.3, t * 0.22));
+    col += vec3(0.42, 0.30, 0.14) * rain * pow(streak, 2.0) * 0.85;
+    col += vec3(0.12, 0.17, 0.24) * rain * streak * 0.4;
+
+    let dist = length(in.world - G.cam_pos.xyz);
+    return vec4(fog_mix(col, dist, rain), 1.0);
+}
+
 // ---------------- buildings (PLATEAU photo textures) ----------------
 
 @group(1) @binding(0) var atlas_tex: texture_2d<f32>;
@@ -216,7 +248,10 @@ fn fs_bldg(in: BldgOut) -> @location(0) vec4<f32> {
         let cell = floor(vec2(u, v));
         let f = fract(vec2(u, v));
         let inside = step(0.18, f.x) * step(f.x, 0.86) * step(0.25, f.y) * step(f.y, 0.80);
-        let on = step(0.82, hash21(cell + vec2(in.hash * 251.0, in.hash * 97.0)));
+        // Offices light up by floor: some floors work late, most are dark.
+        let floor_lit = step(0.58, hash21(vec2(cell.y * 3.1, in.hash * 173.0)));
+        let on = floor_lit
+            * step(0.35, hash21(cell + vec2(in.hash * 251.0, in.hash * 97.0)));
         let flicker = 0.85 + 0.15 * sin(t * 1.3 + hash21(cell) * 40.0);
         let warm = mix(vec3(1.0, 0.72, 0.40), vec3(0.75, 0.85, 1.0), step(0.8, hash21(cell + 7.7)));
         // Windows brighten where the photo already has glazing (darker areas).

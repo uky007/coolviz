@@ -189,6 +189,27 @@ impl Scene {
             .upload_city(device, queue, &self.clamp_samp, tiles);
     }
 
+    pub fn upload_roads(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
+        self.tokyo.upload_roads(device, verts, indices);
+    }
+
+    pub fn upload_static_lights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &[u8],
+    ) {
+        self.tokyo
+            .lights_static
+            .upload(device, queue, &self.globals_buf, data);
+    }
+
+    pub fn upload_car_lights(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[u8]) {
+        self.tokyo
+            .lights_cars
+            .upload(device, queue, &self.globals_buf, data);
+    }
+
     pub fn upload_rain(
         &mut self,
         device: &wgpu::Device,

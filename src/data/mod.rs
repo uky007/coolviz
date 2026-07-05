@@ -7,6 +7,7 @@ pub mod landmask;
 pub mod plateau;
 pub mod quakes;
 pub mod rain;
+pub mod roads;
 pub mod sats;
 pub mod wind;
 
@@ -40,6 +41,15 @@ pub struct SatGpu {
     pub pos: [f32; 4],
     /// xyz world per second, w = brightness.
     pub vel: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LightGpu {
+    /// xyz local meters, w = kind (0 lamp, 1 head, 2 tail, 3 beacon).
+    pub pos: [f32; 4],
+    /// x = hash, w = brightness.
+    pub aux: [f32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +91,14 @@ pub enum DataMsg {
     },
     CityMesh {
         tiles: Vec<plateau::CityTile>,
+        beacons: Vec<LightGpu>,
         label: String,
+    },
+    Roads {
+        paths: Vec<(Vec<[f32; 2]>, u8)>,
+        ribbon_verts: Vec<[f32; 4]>,
+        ribbon_indices: Vec<u32>,
+        lamps: Vec<LightGpu>,
     },
     Rain {
         size: u32,
@@ -129,6 +146,7 @@ pub fn spawn_city(tx: Sender<DataMsg>) {
             Ok(mesh) => {
                 let _ = tx.send(DataMsg::CityMesh {
                     tiles: mesh.tiles,
+                    beacons: mesh.beacons,
                     label: mesh.label,
                 });
             }
@@ -137,6 +155,14 @@ pub fn spawn_city(tx: Sender<DataMsg>) {
                 let _ = tx.send(DataMsg::Note(format!("PLATEAU load failed: {e}")));
             }
         })
+        .ok();
+}
+
+/// Start the (one-shot) OSM road loader. Call once, lazily.
+pub fn spawn_roads(tx: Sender<DataMsg>) {
+    std::thread::Builder::new()
+        .name("roads".into())
+        .spawn(move || roads::run(tx))
         .ok();
 }
 

@@ -19,8 +19,92 @@ use chrono::Utc;
 use eframe::egui;
 
 use camera::OrbitCamera;
-use data::{DataMsg, QuakeCpu, Source};
+use data::{DataMsg, LightGpu, QuakeCpu, Source};
 use scene::{FrameInput, Scene, SceneAssets, SceneMode};
+
+// ------------------------------------------------------------- car sim ----
+
+struct Car {
+    path: usize,
+    s: f32,
+    speed: f32,
+    dir: f32,
+}
+
+/// Tiny traffic simulation driving light sprites along OSM roads.
+struct CarSim {
+    paths: Vec<(Vec<glam::Vec2>, Vec<f32>, f32)>, // points, cumulative length, total
+    cars: Vec<Car>,
+}
+
+impl CarSim {
+    fn new(paths_msg: &[(Vec<[f32; 2]>, u8)], n_cars: usize) -> Self {
+        let mut paths = Vec::new();
+        for (pts, class) in paths_msg {
+            if *class > 4 || pts.len() < 2 {
+                continue;
+            }
+            let v: Vec<glam::Vec2> = pts.iter().map(|p| glam::Vec2::from(*p)).collect();
+            let mut cum = vec![0.0f32];
+            for seg in v.windows(2) {
+                cum.push(cum.last().unwrap() + seg[0].distance(seg[1]));
+            }
+            let total = *cum.last().unwrap();
+            if total > 80.0 {
+                paths.push((v, cum, total));
+            }
+        }
+        let mut cars = Vec::new();
+        if !paths.is_empty() {
+            for _ in 0..n_cars {
+                let path = fastrand::usize(..paths.len());
+                cars.push(Car {
+                    path,
+                    s: fastrand::f32() * paths[path].2,
+                    speed: 7.0 + fastrand::f32() * 8.0,
+                    dir: if fastrand::bool() { 1.0 } else { -1.0 },
+                });
+            }
+        }
+        Self { paths, cars }
+    }
+
+    fn step(&mut self, dt: f32) -> Vec<LightGpu> {
+        let mut out = Vec::with_capacity(self.cars.len() * 2);
+        for car in &mut self.cars {
+            let (pts, cum, total) = &self.paths[car.path];
+            car.s += car.speed * dt * car.dir;
+            if car.s < 0.0 || car.s > *total {
+                // Turn around at the end of the road.
+                car.dir = -car.dir;
+                car.s = car.s.clamp(0.0, *total);
+            }
+            // Locate the segment.
+            let mut i = 1;
+            while i < cum.len() - 1 && cum[i] < car.s {
+                i += 1;
+            }
+            let seg_len = (cum[i] - cum[i - 1]).max(1e-3);
+            let f = (car.s - cum[i - 1]) / seg_len;
+            let d = (pts[i] - pts[i - 1]).normalize_or_zero() * car.dir;
+            let pos = pts[i - 1].lerp(pts[i], f.clamp(0.0, 1.0));
+            // Keep-left lane offset.
+            let lane = glam::Vec2::new(-d.y, d.x) * 2.6;
+            let p = pos + lane;
+            let head = p + d * 2.1;
+            let tail = p - d * 2.1;
+            out.push(LightGpu {
+                pos: [head.x, 1.0, head.y, 1.0],
+                aux: [0.0, 0.0, 0.0, 1.0],
+            });
+            out.push(LightGpu {
+                pos: [tail.x, 1.0, tail.y, 2.0],
+                aux: [0.0, 0.0, 0.0, 1.0],
+            });
+        }
+        out
+    }
+}
 
 /// HUD orbit distance (1.18..20) -> meters, per local mode.
 const TOKYO_DIST_SCALE: f32 = 450.0;
@@ -126,6 +210,9 @@ struct App {
     sat_names: Vec<String>,
     quake_list: Vec<QuakeCpu>,
     wind_grid: Option<(u32, u32, Vec<[u16; 2]>)>,
+    cars: Option<CarSim>,
+    lamp_lights: Vec<LightGpu>,
+    beacon_lights: Vec<LightGpu>,
     tex: Option<(egui::TextureId, (u32, u32))>,
     // UI state
     show_wind: bool,
@@ -188,6 +275,9 @@ impl App {
             sat_names: Vec::new(),
             quake_list: Vec::new(),
             wind_grid: None,
+            cars: None,
+            lamp_lights: Vec::new(),
+            beacon_lights: Vec::new(),
             tex: None,
             show_wind: true,
             show_sats: true,
@@ -250,9 +340,27 @@ impl App {
                     self.scene.upload_clouds(&rs.device, &rs.queue, w, h, &rgba);
                     self.status.clouds = Some(label);
                 }
-                DataMsg::CityMesh { tiles, label } => {
+                DataMsg::CityMesh {
+                    tiles,
+                    beacons,
+                    label,
+                } => {
                     self.scene.upload_city(&rs.device, &rs.queue, &tiles);
+                    self.beacon_lights = beacons;
+                    self.refresh_static_lights(rs);
                     self.status.city = Some(label);
+                }
+                DataMsg::Roads {
+                    paths,
+                    ribbon_verts,
+                    ribbon_indices,
+                    lamps,
+                } => {
+                    self.scene
+                        .upload_roads(&rs.device, &ribbon_verts, &ribbon_indices);
+                    self.lamp_lights = lamps;
+                    self.refresh_static_lights(rs);
+                    self.cars = Some(CarSim::new(&paths, 340));
                 }
                 DataMsg::Rain {
                     size,
@@ -318,12 +426,22 @@ impl App {
         }
     }
 
+    fn refresh_static_lights(&mut self, rs: &egui_wgpu::RenderState) {
+        let mut all = self.lamp_lights.clone();
+        all.extend_from_slice(&self.beacon_lights);
+        if !all.is_empty() {
+            self.scene
+                .upload_static_lights(&rs.device, &rs.queue, bytemuck::cast_slice(&all));
+        }
+    }
+
     fn set_mode(&mut self, mode: SceneMode) {
         self.mode = mode;
         if mode == SceneMode::Tokyo && !self.city_spawned {
             self.city_spawned = true;
             data::spawn_city(self.tx.clone());
             data::spawn_rain(self.tx.clone());
+            data::spawn_roads(self.tx.clone());
         }
     }
 
@@ -643,6 +761,14 @@ impl eframe::App for App {
             SceneMode::Tokyo => {
                 self.cam_city.update(dt, drag, scroll, pinch, avail.y);
                 self.cam_city.lat = self.cam_city.lat.max(4.0);
+                if let Some(cars) = &mut self.cars {
+                    let lights = cars.step(dt);
+                    self.scene.upload_car_lights(
+                        &rs.device,
+                        &rs.queue,
+                        bytemuck::cast_slice(&lights),
+                    );
+                }
             }
             SceneMode::Okinawa => {
                 self.cam_ocean.update(dt, drag, scroll, pinch, avail.y);
@@ -973,6 +1099,7 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
     let mut scene = Scene::new(&device, &queue, &assets);
     let app_epoch_unix = astro::unix_seconds(Utc::now());
 
+    let mut car_sim: Option<CarSim> = None;
     if o.mode == SceneMode::Tokyo {
         let mesh = data::plateau::load_city()?;
         log::info!("shot: {}", mesh.label);
@@ -983,6 +1110,18 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
                 scene.upload_rain(&device, &queue, g.size, &g.levels, g.bounds);
             }
             Err(e) => log::warn!("shot: rain unavailable ({e})"),
+        }
+        match data::roads::load_roads() {
+            Ok(net) => {
+                scene.upload_roads(&device, &net.ribbon_verts, &net.ribbon_indices);
+                let mut statics = net.lamps.clone();
+                statics.extend_from_slice(&mesh.beacons);
+                scene.upload_static_lights(&device, &queue, bytemuck::cast_slice(&statics));
+                let paths: Vec<(Vec<[f32; 2]>, u8)> =
+                    net.paths.into_iter().map(|p| (p.pts, p.class)).collect();
+                car_sim = Some(CarSim::new(&paths, 340));
+            }
+            Err(e) => log::warn!("shot: roads unavailable ({e})"),
         }
     }
 
@@ -1029,6 +1168,10 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
     let total = o.frames + if o.framedump.is_some() { o.warmup } else { 0 };
     let dt = 1.0 / 60.0;
     for i in 0..total {
+        if let Some(cars) = &mut car_sim {
+            let lights = cars.step(dt);
+            scene.upload_car_lights(&device, &queue, bytemuck::cast_slice(&lights));
+        }
         cam.lon += o.spin * dt;
         cam.dist *= o.dzoom.powf(dt);
         cam.update(dt, (0.0, 0.0), 0.0, 1.0, o.size.1 as f32);

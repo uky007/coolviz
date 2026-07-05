@@ -69,7 +69,11 @@ pub struct TokyoPass {
     sky_pl: wgpu::RenderPipeline,
     ground_pl: wgpu::RenderPipeline,
     bldg_pl: wgpu::RenderPipeline,
+    road_pl: wgpu::RenderPipeline,
     bldg: Vec<CityTileGpu>,
+    roads: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    pub lights_static: super::SpritePass,
+    pub lights_cars: super::SpritePass,
     pub city_loaded: bool,
     // Rain.
     rainmap_buf: wgpu::Buffer,
@@ -243,6 +247,22 @@ impl TokyoPass {
             "vs_ground",
             "fs_ground",
             &[],
+            wgpu::CompareFunction::LessEqual,
+        );
+        let road_vlayout = wgpu::VertexBufferLayout {
+            array_stride: 16,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 0,
+            }],
+        };
+        let road_pl = mk_city_pl(
+            "tokyo-road",
+            "vs_road",
+            "fs_road",
+            std::slice::from_ref(&road_vlayout),
             wgpu::CompareFunction::LessEqual,
         );
 
@@ -439,6 +459,21 @@ impl TokyoPass {
             cache: None,
         });
 
+        let lights_static = super::SpritePass::new(
+            device,
+            globals,
+            include_str!("../shaders/citylights.wgsl"),
+            "citylights-static",
+            8_000,
+        );
+        let lights_cars = super::SpritePass::new(
+            device,
+            globals,
+            include_str!("../shaders/citylights.wgsl"),
+            "citylights-cars",
+            2_000,
+        );
+
         Self {
             city_bgl,
             city_bg,
@@ -446,7 +481,11 @@ impl TokyoPass {
             sky_pl,
             ground_pl,
             bldg_pl,
+            road_pl,
             bldg: Vec::new(),
+            roads: None,
+            lights_static,
+            lights_cars,
             city_loaded: false,
             rainmap_buf,
             rainsim_buf,
@@ -684,12 +723,32 @@ impl TokyoPass {
         cp.dispatch_workgroups(DROPS.div_ceil(256), 1, 1);
     }
 
+    pub fn upload_roads(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("road-verts"),
+            contents: bytemuck::cast_slice(verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("road-indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.roads = Some((vbuf, ibuf, indices.len() as u32));
+    }
+
     pub fn record(&self, rp: &mut wgpu::RenderPass<'_>) {
         rp.set_pipeline(&self.sky_pl);
         rp.set_bind_group(0, &self.city_bg, &[]);
         rp.draw(0..3, 0..1);
         rp.set_pipeline(&self.ground_pl);
         rp.draw(0..6, 0..1);
+        if let Some((vbuf, ibuf, n)) = &self.roads {
+            rp.set_pipeline(&self.road_pl);
+            rp.set_vertex_buffer(0, vbuf.slice(..));
+            rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            rp.draw_indexed(0..*n, 0, 0..1);
+        }
         if !self.bldg.is_empty() {
             rp.set_pipeline(&self.bldg_pl);
             for tile in &self.bldg {
@@ -699,6 +758,8 @@ impl TokyoPass {
                 rp.draw_indexed(0..tile.n_indices, 0, 0..1);
             }
         }
+        self.lights_static.record(rp);
+        self.lights_cars.record(rp);
         rp.set_pipeline(&self.draw_pl);
         rp.set_bind_group(0, &self.draw_bg, &[]);
         rp.draw(0..DROPS * 2, 0..1);
