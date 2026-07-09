@@ -14,9 +14,36 @@ struct Globals {
     layers2: vec4<f32>,
 };
 
+struct SimMap {
+    a: vec4<f32>, // x,y = grid origin (world xz), z = cell, w = N
+    b: vec4<f32>, // x = enabled
+};
+
 @group(0) @binding(0) var<uniform> G: Globals;
+@group(0) @binding(1) var<uniform> SM: SimMap;
+@group(0) @binding(2) var sim_tex: texture_2d<f32>;
+@group(0) @binding(3) var sim_samp: sampler;
 
 const SUN: vec3<f32> = vec3(-0.42, 0.72, -0.55);
+
+/// Sim-domain blend weight (0 outside, 1 well inside).
+fn sim_w(xz: vec2<f32>) -> f32 {
+    if SM.b.x < 0.5 {
+        return 0.0;
+    }
+    let ext = SM.a.z * SM.a.w;
+    let uv = (xz - SM.a.xy) / ext;
+    let m = min(min(uv.x, uv.y), 1.0 - max(uv.x, uv.y));
+    return smoothstep(0.01, 0.10, m);
+}
+
+/// (surface elevation, depth, speed) from the simulation.
+fn sim_surface(xz: vec2<f32>) -> vec3<f32> {
+    let ext = SM.a.z * SM.a.w;
+    let uv = (xz - SM.a.xy) / ext;
+    let s = textureSampleLevel(sim_tex, sim_samp, uv, 0.0);
+    return vec3(s.r + s.g, s.g, s.b);
+}
 const ISLAND: vec2<f32> = vec2(-330.0, -400.0);
 const REEF_R: f32 = 940.0;
 
@@ -115,10 +142,27 @@ fn wave_h(xz: vec2<f32>, t: f32, dist: f32) -> f32 {
     return h;
 }
 
+/// Water surface height: simulation inside its domain, procedural outside.
+fn surf_h(xz: vec2<f32>, t: f32, dist: f32) -> f32 {
+    let w = sim_w(xz);
+    var h_proc = 0.0;
+    if w < 0.999 {
+        h_proc = wave_h(xz, t, dist);
+    }
+    if w > 0.001 {
+        let s = sim_surface(xz);
+        // Fine chop on top of the coarse sim surface.
+        let lod = 1.0 / (1.0 + dist * 0.004);
+        let chop = (vnoise(xz * 0.55 + vec2(t * 0.35, -t * 0.22)) - 0.5) * 0.05 * lod;
+        return mix(h_proc, s.x + chop, w);
+    }
+    return h_proc;
+}
+
 fn water_normal(xz: vec2<f32>, t: f32, dist: f32) -> vec3<f32> {
-    let e = 0.55;
-    let dx = wave_h(xz + vec2(e, 0.0), t, dist) - wave_h(xz - vec2(e, 0.0), t, dist);
-    let dz = wave_h(xz + vec2(0.0, e), t, dist) - wave_h(xz - vec2(0.0, e), t, dist);
+    let e = max(0.55, SM.a.z * sim_w(xz));
+    let dx = surf_h(xz + vec2(e, 0.0), t, dist) - surf_h(xz - vec2(e, 0.0), t, dist);
+    let dz = surf_h(xz + vec2(0.0, e), t, dist) - surf_h(xz - vec2(0.0, e), t, dist);
     var n = vec3(-dx, 2.0 * e, -dz);
     // Capillary shimmer, fading with distance to avoid moire.
     let cap = 0.35 / (1.0 + dist * 0.02);
@@ -243,9 +287,9 @@ fn fs_main(in: FullOut) -> @location(0) vec4<f32> {
     var t_water = 1e9;
     if rd.y < -1e-4 {
         var tw = -ro.y / rd.y;
-        for (var i = 0; i < 4; i++) {
+        for (var i = 0; i < 5; i++) {
             let p = ro + rd * tw;
-            tw += (wave_h(p.xz, t, tw) - p.y) / rd.y;
+            tw += (surf_h(p.xz, t, tw) - p.y) / rd.y;
         }
         t_water = max(tw, 0.0);
     }
@@ -310,6 +354,19 @@ fn fs_main(in: FullOut) -> @location(0) vec4<f32> {
             * (pow(sun_align, 950.0) * 2.4 + pow(sun_align, 55.0) * sparkle * 1.15 * near);
 
         // ---- breaking foam ----
+        // Simulation-driven foam where the sim is active.
+        let simw = sim_w(sp.xz);
+        if simw > 0.01 {
+            let s = sim_surface(sp.xz);
+            let froude = s.z / sqrt(9.81 * max(s.y, 0.05));
+            let sim_foam = smoothstep(0.55, 1.2, froude)
+                * (0.55 + 0.45 * vnoise(sp.xz * 0.9 + t * 0.4));
+            col = mix(
+                col,
+                vec3(0.97, 1.0, 1.0),
+                clamp(sim_foam * simw * 0.85, 0.0, 0.85),
+            );
+        }
         let ph = swell_phase(rr, t);
         let crest = 0.5 + 0.5 * sin(ph + 0.7);
         let shallow = exp(-depth_here * 0.85);

@@ -164,6 +164,80 @@ fn fs_ground(in: GroundOut) -> @location(0) vec4<f32> {
     return vec4(fog_mix(col, dist, rain), 1.0);
 }
 
+// ---------------- flood water (shallow-water sim surface) ----------------
+
+struct SimMap {
+    a: vec4<f32>, // x,y origin, z cell, w N
+    b: vec4<f32>,
+};
+
+@group(0) @binding(4) var<uniform> WSM: SimMap;
+@group(0) @binding(5) var water_tex: texture_2d<f32>;
+
+const WGRID: u32 = 512u;
+
+struct WaterOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) hv: vec2<f32>, // depth, speed
+};
+
+@vertex
+fn vs_water(@builtin(vertex_index) vi: u32) -> WaterOut {
+    let gx = vi % WGRID;
+    let gy = vi / WGRID;
+    let uv = vec2(f32(gx), f32(gy)) / f32(WGRID - 1u);
+    let ext = WSM.a.z * WSM.a.w;
+    let xz = WSM.a.xy + uv * ext;
+    // Exact texel read: filtering would blend water heights across the
+    // building-stamped terrain cliffs and raise phantom water towers.
+    let n_tex = i32(WSM.a.w);
+    let tc = vec2<i32>(
+        min(i32(gx), n_tex - 1),
+        min(i32(gy), n_tex - 1),
+    );
+    let s = textureLoad(water_tex, tc, 0);
+    var y = s.r + s.g + 0.05;
+    if s.g < 0.008 {
+        y = -80.0; // dry: sink the vertex out of sight
+    }
+    var out: WaterOut;
+    out.world = vec3(xz.x, y, xz.y);
+    out.pos = G.view_proj * vec4(out.world, 1.0);
+    out.hv = vec2(s.g, s.b);
+    return out;
+}
+
+@fragment
+fn fs_water(in: WaterOut) -> @location(0) vec4<f32> {
+    let t = G.cam_pos.w;
+    // Muddy flood water: sediment brown peaks around 1.5 m, then deep
+    // water swallows the light and goes dark.
+    var col = mix(
+        vec3(0.016, 0.021, 0.028),
+        vec3(0.058, 0.045, 0.031),
+        clamp(in.hv.x * 0.8, 0.0, 1.0),
+    );
+    col *= 1.0 / (1.0 + max(in.hv.x - 1.8, 0.0) * 0.9);
+    let dist = length(in.world - G.cam_pos.xyz);
+    let lod = 1.0 / (1.0 + dist * 0.0022);
+    // City lights smeared on the moving surface (fade far off: unresolved
+    // noise otherwise averages into a milky sheen).
+    let streak = vnoise(in.world.xz * 0.5 + vec2(t * 1.3, -t * 1.0))
+        * vnoise(in.world.xz * 0.13 + vec2(-t * 0.25, t * 0.2));
+    col += vec3(0.34, 0.25, 0.12) * pow(streak, 2.0) * 0.55 * lod;
+    col += vec3(0.10, 0.14, 0.20) * streak * 0.22 * lod;
+    // Patchy turbulent foam where deep water runs fast.
+    let fmask = vnoise(in.world.xz * 0.9 + vec2(t * 0.5, -t * 0.3));
+    let foam = smoothstep(2.0, 3.8, in.hv.y) * smoothstep(0.06, 0.30, in.hv.x)
+        * smoothstep(0.45, 0.75, fmask);
+    col = mix(col, vec3(0.33, 0.34, 0.33), clamp(foam, 0.0, 0.30) * lod);
+
+    // Water is a grazing-angle mirror of the dark sky: keep fog weak so
+    // distant sheets stay dark glass instead of washing out.
+    return vec4(fog_mix(col, dist, 0.22), 1.0);
+}
+
 // ---------------- roads ----------------
 
 struct RoadOut {

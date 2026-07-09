@@ -8,7 +8,10 @@ mod ocean;
 mod particles;
 mod post;
 mod sprites;
+mod swe;
 mod tokyo;
+
+pub use swe::SweConfig;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
@@ -73,6 +76,14 @@ pub struct FrameInput {
     pub mode: SceneMode,
     /// Tokyo mode: use the procedural demo storm instead of live nowcast.
     pub rain_demo: bool,
+    /// Shallow-water sim controls.
+    pub swe_speed: f32,
+    /// 0 = rain only, 1 = levee-breach scenario (Tokyo).
+    pub flood_source: u32,
+    /// Grid-uv -> rain-uv affine for the flood rain source.
+    pub rain_affine: [f32; 4],
+    /// Okinawa: world x, z, amount(m) splash from the mouse.
+    pub splash: Option<[f32; 3]>,
 }
 
 struct Targets {
@@ -105,6 +116,9 @@ pub struct Scene {
     post: post::PostPass,
     pub tokyo: tokyo::TokyoPass,
     ocean: ocean::OceanPass,
+    pub swe_tokyo: Option<swe::SweSim>,
+    pub swe_oki: Option<swe::SweSim>,
+    dummy_rain_view: wgpu::TextureView,
     targets: Option<Targets>,
     trail_front: usize,
     have_clouds: bool,
@@ -159,7 +173,22 @@ impl Scene {
         );
         let post = post::PostPass::new(device);
         let tokyo = tokyo::TokyoPass::new(device, &globals_buf, &clamp_samp);
-        let ocean = ocean::OceanPass::new(device, &globals_buf);
+        let dummy_rain = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy-rain"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dummy_rain_view = dummy_rain.create_view(&wgpu::TextureViewDescriptor::default());
+        let ocean = ocean::OceanPass::new(device, &globals_buf, &dummy_rain_view, &clamp_samp);
 
         Self {
             globals_buf,
@@ -173,10 +202,113 @@ impl Scene {
             post,
             tokyo,
             ocean,
+            swe_tokyo: None,
+            swe_oki: None,
+            dummy_rain_view,
             targets: None,
             trail_front: 0,
             have_clouds: false,
         }
+    }
+
+    /// Create the Tokyo flood sim once terrain + buildings are stamped.
+    pub fn init_swe_tokyo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cfg: SweConfig,
+        terrain: &[f32],
+    ) {
+        let h0 = vec![0.0f32; terrain.len()];
+        let rain_view = self.tokyo.rain_view();
+        let sim = swe::SweSim::new(
+            device,
+            queue,
+            cfg,
+            terrain,
+            h0,
+            &rain_view,
+            &self.clamp_samp,
+        );
+        self.tokyo.set_water(
+            device,
+            &self.globals_buf,
+            &sim.map_buf,
+            &sim.view,
+            &self.clamp_samp,
+        );
+        self.swe_tokyo = Some(sim);
+    }
+
+    /// Lazily create the interactive Okinawa lagoon sim.
+    fn ensure_swe_oki(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.swe_oki.is_some() {
+            return;
+        }
+        let n = 512u32;
+        let cell = 5.0f32;
+        let origin = [-330.0 - 1280.0, -400.0 - 1280.0];
+        let mut terr = vec![0.0f32; (n * n) as usize];
+        let mut h0 = vec![0.0f32; (n * n) as usize];
+        for gy in 0..n {
+            for gx in 0..n {
+                let x = origin[0] + (gx as f32 + 0.5) * cell;
+                let z = origin[1] + (gy as f32 + 0.5) * cell;
+                let b = crate::data::oki_terrain(glam::Vec2::new(x, z));
+                let i = (gy * n + gx) as usize;
+                terr[i] = b;
+                h0[i] = (-b).max(0.0);
+            }
+        }
+        // Source mode 2 reuses the rain-affine slot for the swell geometry:
+        // island centre in grid cells, plus wavenumber per cell (~90 m swell).
+        let island_g = [(-330.0 - origin[0]) / cell, (-400.0 - origin[1]) / cell];
+        let cfg = SweConfig {
+            n,
+            cell,
+            origin,
+            source_mode: 2,
+            sea_level: 0.0,
+            swell_amp: 0.5,
+            swell_period: 8.0,
+            rain_rate: 0.0,
+            rain_affine: [
+                island_g[0],
+                island_g[1],
+                std::f32::consts::TAU * cell / 90.0,
+                0.0,
+            ],
+        };
+        let mut sim = swe::SweSim::new(
+            device,
+            queue,
+            cfg,
+            &terr,
+            h0,
+            &self.dummy_rain_view,
+            &self.clamp_samp,
+        );
+        // Let the swell cross the lagoon before anyone sees it.
+        sim.prewarm(device, queue, 90.0);
+        self.ocean.set_sim(
+            device,
+            &self.globals_buf,
+            &sim.map_buf,
+            &sim.view,
+            &self.clamp_samp,
+        );
+        self.swe_oki = Some(sim);
+        log::info!("okinawa lagoon sim initialised (512x512, 5 m cells)");
+    }
+
+    pub fn reset_swe_tokyo(&mut self, queue: &wgpu::Queue) {
+        if let Some(s) = &mut self.swe_tokyo {
+            s.reset(queue);
+        }
+    }
+
+    pub fn tokyo_sim_time(&self) -> Option<f32> {
+        self.swe_tokyo.as_ref().map(|s| s.sim_time)
     }
 
     pub fn upload_city(
@@ -227,6 +359,11 @@ impl Scene {
             levels,
             bounds,
         );
+        // The nowcast texture may have just been (re)created; point the
+        // flood sim's rain source at the fresh one.
+        if let Some(s) = &mut self.swe_tokyo {
+            s.set_rain(device, &self.tokyo.rain_view(), &self.clamp_samp);
+        }
     }
 
     pub fn upload_wind(
@@ -465,11 +602,47 @@ impl Scene {
 
         let front = self.trail_front;
         let back = 1 - front;
-        let t = self.targets.as_ref().unwrap();
+
+        if f.mode == SceneMode::Okinawa {
+            self.ensure_swe_oki(device, queue);
+        }
 
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("frame"),
         });
+
+        // Shallow-water simulation substeps.
+        match f.mode {
+            SceneMode::Tokyo => {
+                if let Some(s) = &mut self.swe_tokyo {
+                    s.cfg.rain_affine = f.rain_affine;
+                    // No nowcast mapping yet -> no rain source.
+                    let cfg_rain = if f.rain_affine == [0.0; 4] {
+                        0.0
+                    } else {
+                        s.cfg.rain_rate
+                    };
+                    s.step(
+                        &mut enc,
+                        queue,
+                        f.sim_dt,
+                        f.swe_speed,
+                        Some(f.flood_source),
+                        0.0035, // river stage rise (m/s)
+                        cfg_rain,
+                        None,
+                    );
+                }
+            }
+            SceneMode::Okinawa => {
+                if let Some(s) = &mut self.swe_oki {
+                    s.step(&mut enc, queue, f.sim_dt, 1.0, None, 0.0, 0.0, f.splash);
+                }
+            }
+            SceneMode::Earth => {}
+        }
+
+        let t = self.targets.as_ref().unwrap();
 
         // 1+2. Mode-specific scene pass and simulation pass.
         {

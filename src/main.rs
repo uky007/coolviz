@@ -134,56 +134,7 @@ fn ray_aabb(ro: glam::Vec3, rd: glam::Vec3, min: [f32; 3], max: [f32; 3]) -> Opt
     }
 }
 
-// ---- CPU port of the Okinawa terrain (ocean.wgsl) for depth hovering ----
-
-fn oki_hash21(p: glam::Vec2) -> f32 {
-    let mut q = (p * glam::Vec2::new(123.34, 456.21)).fract();
-    q += glam::Vec2::splat(q.dot(q + glam::Vec2::splat(45.32)));
-    (q.x * q.y).fract()
-}
-
-fn oki_vnoise(p: glam::Vec2) -> f32 {
-    let i = p.floor();
-    let f = p.fract();
-    let u = f * f * (glam::Vec2::splat(3.0) - 2.0 * f);
-    let a = oki_hash21(i);
-    let b = oki_hash21(i + glam::Vec2::X);
-    let c = oki_hash21(i + glam::Vec2::Y);
-    let d = oki_hash21(i + glam::Vec2::ONE);
-    lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y)
-}
-
-fn oki_fbm(p: glam::Vec2) -> f32 {
-    let m = glam::Mat2::from_cols_array(&[1.6, -1.2, 1.2, 1.6]);
-    let (mut v, mut a, mut q) = (0.0, 0.5, p);
-    for _ in 0..4 {
-        v += a * oki_vnoise(q);
-        q = m * q;
-        a *= 0.5;
-    }
-    v
-}
-
-fn oki_terrain(xz: glam::Vec2) -> f32 {
-    let island = glam::Vec2::new(-330.0, -400.0);
-    let rr = xz.distance(island) + (oki_fbm(xz * 0.004) - 0.5) * 70.0;
-    let smooth = |e0: f32, e1: f32, x: f32| {
-        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-    let mut h = 30.0 * smooth(430.0, 60.0, rr)
-        + (430.0 - rr) * 0.045
-        + 4.0 * (oki_fbm(xz * 0.02) - 0.5) * smooth(400.0, 200.0, rr);
-    h = h.min(34.0);
-    let lagoon = -1.0 - 2.4 * smooth(430.0, 900.0, rr);
-    h = h.min(lagoon.max((430.0 - rr) * 0.045));
-    let coral_n = oki_vnoise(xz * 0.05 + 31.7) * 0.65 + oki_vnoise(xz * 0.15 + 7.1) * 0.35;
-    let coral = smooth(0.58, 0.66, coral_n) * smooth(500.0, 590.0, rr) * smooth(980.0, 880.0, rr);
-    h += coral * (1.4 + 0.6 * oki_vnoise(xz * 0.3));
-    h += 2.4 * (-((rr - 940.0) / 55.0).powi(2)).exp();
-    h -= 44.0 * smooth(955.0, 1250.0, rr);
-    h
-}
+use data::oki_terrain;
 
 /// Parse the next CLI value as f32, rejecting non-finite input and clamping
 /// to a sane range; falls back to `cur` when absent or invalid.
@@ -280,6 +231,10 @@ struct App {
     beacon_lights: Vec<LightGpu>,
     buildings: Vec<data::plateau::BuildingInfo>,
     rain_grid: Option<(u32, Vec<u8>, [f64; 4])>,
+    terrain_grid: Option<(u32, f32, [f32; 2], Vec<f32>)>,
+    flood_on: bool,
+    sim_speed: f32,
+    pending_splash: Option<[f32; 3]>,
     tex: Option<(egui::TextureId, (u32, u32))>,
     // UI state
     show_wind: bool,
@@ -348,6 +303,10 @@ impl App {
             beacon_lights: Vec::new(),
             buildings: Vec::new(),
             rain_grid: None,
+            terrain_grid: None,
+            flood_on: false,
+            sim_speed: 120.0,
+            pending_splash: None,
             tex: None,
             show_wind: true,
             show_sats: true,
@@ -421,6 +380,7 @@ impl App {
                     self.buildings = buildings;
                     self.refresh_static_lights(rs);
                     self.status.city = Some(label);
+                    self.try_init_flood(rs);
                 }
                 DataMsg::Roads {
                     paths,
@@ -450,12 +410,91 @@ impl App {
                     }
                     self.status.rain = Some((label, max_level));
                 }
+                DataMsg::Terrain {
+                    n,
+                    cell,
+                    origin,
+                    heights,
+                } => {
+                    self.terrain_grid = Some((n, cell, origin, heights));
+                    self.try_init_flood(rs);
+                }
                 DataMsg::Note(s) => log::info!("{s}"),
             }
         }
     }
 
-    fn frame_input(&self, px: (u32, u32), dt: f32) -> FrameInput {
+    /// Build the flood-sim terrain (GSI DEM + stamped building volumes) once
+    /// both data sets have arrived.
+    fn try_init_flood(&mut self, rs: &egui_wgpu::RenderState) {
+        if self.scene.swe_tokyo.is_some() || self.buildings.is_empty() {
+            return;
+        }
+        let Some((n, cell, origin, heights)) = &self.terrain_grid else {
+            return;
+        };
+        let (n, cell, origin) = (*n, *cell, *origin);
+        let mut b = heights.clone();
+        for bld in &self.buildings {
+            let h = (bld.max[1] - bld.min[1]).clamp(3.0, 120.0);
+            let gx0 = (((bld.min[0] - origin[0]) / cell).floor().max(0.0)) as u32;
+            let gx1 = (((bld.max[0] - origin[0]) / cell).ceil()).min(n as f32 - 1.0) as u32;
+            let gz0 = (((bld.min[2] - origin[1]) / cell).floor().max(0.0)) as u32;
+            let gz1 = (((bld.max[2] - origin[1]) / cell).ceil()).min(n as f32 - 1.0) as u32;
+            if gx0 > gx1 || gz0 > gz1 || gx1 >= n || gz1 >= n {
+                continue;
+            }
+            for gz in gz0..=gz1 {
+                for gx in gx0..=gx1 {
+                    let i = (gz * n + gx) as usize;
+                    b[i] += h;
+                }
+            }
+        }
+        self.scene.init_swe_tokyo(
+            &rs.device,
+            &rs.queue,
+            scene::SweConfig {
+                n,
+                cell,
+                origin,
+                source_mode: 0,
+                // Base river stage; the flood scenario raises it over time.
+                sea_level: 0.8,
+                swell_amp: 0.0,
+                swell_period: 1.0,
+                rain_rate: 1.32e-4,
+                rain_affine: [0.0; 4],
+            },
+            &b,
+        );
+        log::info!("flood sim ready ({n}x{n} @ {cell} m)");
+    }
+
+    /// Grid-uv -> rain-uv affine mapping for the flood rain source.
+    fn flood_rain_affine(&self) -> [f32; 4] {
+        let (Some((_, _, bounds)), Some((n, cell, origin, _))) = (
+            self.rain_grid.as_ref().map(|(s, l, b)| (*s, l.len(), *b)),
+            self.terrain_grid.as_ref(),
+        ) else {
+            return [0.0; 4];
+        };
+        if self.rain_demo {
+            return [0.0; 4];
+        }
+        let m_lon = 111_320.0 * data::plateau::SITE_LAT.to_radians().cos();
+        let m_lat = 111_132.0;
+        let ext = (*n as f64) * (*cell as f64);
+        let du = bounds[2] - bounds[0];
+        let dv = bounds[1] - bounds[3];
+        let u0 = (data::plateau::SITE_LON + origin[0] as f64 / m_lon - bounds[0]) / du;
+        let us = (ext / m_lon) / du;
+        let v0 = (bounds[1] - (data::plateau::SITE_LAT - origin[1] as f64 / m_lat)) / dv;
+        let vs = (ext / m_lat) / dv;
+        [u0 as f32, v0 as f32, us as f32, vs as f32]
+    }
+
+    fn frame_input(&mut self, px: (u32, u32), dt: f32) -> FrameInput {
         let aspect = px.0 as f32 / px.1.max(1) as f32;
         let (vp, ivp, eye) = match self.mode {
             SceneMode::Earth => self.cam.matrices(aspect),
@@ -496,6 +535,18 @@ impl App {
             frame_index: self.frame_index,
             mode: self.mode,
             rain_demo: self.rain_demo,
+            swe_speed: if self.mode == SceneMode::Tokyo {
+                self.sim_speed
+            } else {
+                1.0
+            },
+            flood_source: u32::from(self.flood_on),
+            rain_affine: if self.mode == SceneMode::Tokyo {
+                self.flood_rain_affine()
+            } else {
+                [0.0; 4]
+            },
+            splash: self.pending_splash.take(),
         }
     }
 
@@ -515,6 +566,7 @@ impl App {
             data::spawn_city(self.tx.clone());
             data::spawn_rain(self.tx.clone());
             data::spawn_roads(self.tx.clone());
+            data::spawn_terrain(self.tx.clone());
         }
     }
 
@@ -604,6 +656,43 @@ impl App {
                         ui.checkbox(&mut self.rain_demo, "demo storm");
                         ui.checkbox(&mut self.cam_city.auto_orbit, "auto-orbit");
                     });
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("FLOOD SIM")
+                            .monospace()
+                            .size(11.5)
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 190, 255)),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.flood_on, "都心河川氾濫シナリオ");
+                        if ui.button("リセット").clicked() {
+                            self.scene.reset_swe_tokyo(&rs.queue);
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.sim_speed, 1.0..=600.0)
+                            .logarithmic(true)
+                            .text("時間倍率"),
+                    );
+                    if let Some(st) = self.scene.tokyo_sim_time() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "シミュレーション経過 {:.0} 分",
+                                st / 60.0
+                            ))
+                            .monospace()
+                            .size(10.5)
+                            .color(DIM),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("地形・建物ロード後に水面が有効になります")
+                                .monospace()
+                                .size(10.0)
+                                .color(DIM),
+                        );
+                    }
                     if self.rain_demo {
                         ui.label(
                             egui::RichText::new("synthetic squall — uncheck for live JMA nowcast")
@@ -624,7 +713,7 @@ impl App {
                 }
                 if self.mode == SceneMode::Okinawa {
                     ui.label(
-                        egui::RichText::new("procedural reef lagoon — no data feeds")
+                        egui::RichText::new("shallow-water sim lagoon · クリックで波紋")
                             .monospace()
                             .size(10.5)
                             .color(DIM),
@@ -874,6 +963,26 @@ impl eframe::App for App {
             SceneMode::Okinawa => {
                 self.cam_ocean.update(dt, drag, scroll, pinch, avail.y);
                 self.cam_ocean.lat = self.cam_ocean.lat.clamp(2.0, 60.0);
+                // Click the lagoon to splash it.
+                if resp.clicked()
+                    && let Some(cur) = resp.hover_pos()
+                {
+                    let aspect = px.0 as f32 / px.1.max(1) as f32;
+                    let (_, ivp, cam) = self.cam_ocean.matrices_local(
+                        aspect,
+                        OKINAWA_TARGET,
+                        self.cam_ocean.dist * OKINAWA_DIST_SCALE,
+                    );
+                    let nx = (cur.x - rect.min.x) / rect.width() * 2.0 - 1.0;
+                    let ny = -((cur.y - rect.min.y) / rect.height() * 2.0 - 1.0);
+                    let pw = ivp * glam::Vec4::new(nx, ny, 0.6, 1.0);
+                    let dir = (pw.truncate() / pw.w - cam).normalize();
+                    if dir.y < -1e-4 {
+                        let t = -cam.y / dir.y;
+                        let p = cam + dir * t;
+                        self.pending_splash = Some([p.x, p.z, 0.45]);
+                    }
+                }
             }
         }
 
@@ -1225,6 +1334,9 @@ struct ShotOpts {
     trail_fade: f32,
     mode: SceneMode,
     demo: bool,
+    flood: bool,
+    /// Local-scene orbit target override (world x, z).
+    target: Option<(f32, f32)>,
 }
 
 fn read_final(
@@ -1325,6 +1437,52 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
             }
             Err(e) => log::warn!("shot: roads unavailable ({e})"),
         }
+        match data::terrain::load_terrain() {
+            Ok((mut b, origin)) => {
+                let (n, cell) = (data::terrain::GRID_N, data::terrain::CELL_M);
+                for bld in &mesh.buildings {
+                    let h = (bld.max[1] - bld.min[1]).clamp(3.0, 120.0);
+                    let gx0 = (((bld.min[0] - origin[0]) / cell).floor().max(0.0)) as u32;
+                    let gx1 = (((bld.max[0] - origin[0]) / cell).ceil()).min(n as f32 - 1.0) as u32;
+                    let gz0 = (((bld.min[2] - origin[1]) / cell).floor().max(0.0)) as u32;
+                    let gz1 = (((bld.max[2] - origin[1]) / cell).ceil()).min(n as f32 - 1.0) as u32;
+                    if gx0 > gx1 || gz0 > gz1 || gx1 >= n || gz1 >= n {
+                        continue;
+                    }
+                    for gz in gz0..=gz1 {
+                        for gx in gx0..=gx1 {
+                            b[(gz * n + gx) as usize] += h;
+                        }
+                    }
+                }
+                if std::env::var_os("COOLVIZ_DEBUG_STAMP").is_some() {
+                    let px: Vec<u8> = b
+                        .iter()
+                        .map(|&v| if v > 11.0 { 255 } else { (v * 8.0) as u8 })
+                        .collect();
+                    if let Some(img) = image::GrayImage::from_raw(n, n, px) {
+                        let _ = img.save("shots/stamp.png");
+                    }
+                }
+                scene.init_swe_tokyo(
+                    &device,
+                    &queue,
+                    scene::SweConfig {
+                        n,
+                        cell,
+                        origin,
+                        source_mode: 0,
+                        sea_level: 0.8,
+                        swell_amp: 0.0,
+                        swell_period: 1.0,
+                        rain_rate: 1.32e-4,
+                        rain_affine: [0.0; 4],
+                    },
+                    &b,
+                );
+            }
+            Err(e) => log::warn!("shot: terrain unavailable ({e})"),
+        }
     }
 
     let mut sat_t0 = app_epoch_unix;
@@ -1381,10 +1539,18 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
         let (vp, ivp, eye) = match o.mode {
             SceneMode::Earth => cam.matrices(aspect),
             SceneMode::Tokyo => {
-                cam.matrices_local(aspect, TOKYO_TARGET, cam.dist * TOKYO_DIST_SCALE)
+                let tgt = match o.target {
+                    Some((x, z)) => glam::Vec3::new(x, 25.0, z),
+                    None => TOKYO_TARGET,
+                };
+                cam.matrices_local(aspect, tgt, cam.dist * TOKYO_DIST_SCALE)
             }
             SceneMode::Okinawa => {
-                cam.matrices_local(aspect, OKINAWA_TARGET, cam.dist * OKINAWA_DIST_SCALE)
+                let tgt = match o.target {
+                    Some((x, z)) => glam::Vec3::new(x, 3.0, z),
+                    None => OKINAWA_TARGET,
+                };
+                cam.matrices_local(aspect, tgt, cam.dist * OKINAWA_DIST_SCALE)
             }
         };
         let utc = Utc::now();
@@ -1407,6 +1573,10 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
             frame_index: i,
             mode: o.mode,
             rain_demo: o.demo,
+            swe_speed: if o.flood { 240.0 } else { 60.0 },
+            flood_source: u32::from(o.flood),
+            rain_affine: [0.0; 4],
+            splash: None,
         };
         scene.render(&device, &queue, o.size, &fi);
         if let Some(dir) = &o.framedump
@@ -1417,6 +1587,16 @@ fn run_shot(o: &ShotOpts, assets: SceneAssets) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(s) = &scene.swe_tokyo {
+        let (mx, mean, wet) = s.depth_stats(&device, &queue);
+        log::info!(
+            "flood sim: t={:.0}s max {:.2}m mean {:.3}m wet cells {}",
+            s.sim_time,
+            mx,
+            mean,
+            wet
+        );
+    }
     let img = read_final(&device, &queue, &scene, o.size.0, o.size.1)?;
     img.save(&o.path)?;
     println!("saved {}", o.path.display());
@@ -1443,6 +1623,8 @@ fn main() -> anyhow::Result<()> {
     let mut trail_fade = 0.958f32;
     let mut mode = SceneMode::Earth;
     let mut demo = true;
+    let mut flood = false;
+    let mut target: Option<(f32, f32)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1477,6 +1659,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             "--demo" => demo = args.next().as_deref() != Some("0"),
+            "--flood" => flood = true,
+            "--target" => {
+                target = args.next().and_then(|v| {
+                    let mut it = v.split(',').map(|p| p.trim().parse::<f32>());
+                    match (it.next(), it.next()) {
+                        (Some(Ok(x)), Some(Ok(z))) => {
+                            Some((x.clamp(-3e4, 3e4), z.clamp(-3e4, 3e4)))
+                        }
+                        _ => None,
+                    }
+                });
+            }
             other => log::warn!("unknown arg: {other}"),
         }
     }
@@ -1499,6 +1693,8 @@ fn main() -> anyhow::Result<()> {
                 trail_fade,
                 mode,
                 demo,
+                flood,
+                target,
             },
             assets,
         );

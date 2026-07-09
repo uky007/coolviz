@@ -70,6 +70,11 @@ pub struct TokyoPass {
     ground_pl: wgpu::RenderPipeline,
     bldg_pl: wgpu::RenderPipeline,
     road_pl: wgpu::RenderPipeline,
+    water_pl: wgpu::RenderPipeline,
+    water_bgl: wgpu::BindGroupLayout,
+    water_bg: Option<wgpu::BindGroup>,
+    water_ibuf: wgpu::Buffer,
+    water_n_idx: u32,
     bldg: Vec<CityTileGpu>,
     roads: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     pub lights_static: super::SpritePass,
@@ -459,6 +464,69 @@ impl TokyoPass {
             cache: None,
         });
 
+        // Flood water surface: an implicit 512x512 grid displaced by the sim.
+        let water_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tokyo-water"),
+            entries: &[
+                entry(0, uniform_ty()),
+                entry(
+                    3,
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ),
+                entry(4, uniform_ty()),
+                entry(5, texture_ty()),
+            ],
+        });
+        let water_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tokyo-water"),
+            bind_group_layouts: &[Some(&water_bgl)],
+            immediate_size: 0,
+        });
+        let water_pl = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tokyo-water"),
+            layout: Some(&water_layout),
+            vertex: wgpu::VertexState {
+                module: &city_shader,
+                entry_point: Some("vs_water"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &city_shader,
+                entry_point: Some("fs_water"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        const WGRID: u32 = 512;
+        let mut widx: Vec<u32> = Vec::with_capacity(((WGRID - 1) * (WGRID - 1) * 6) as usize);
+        for y in 0..WGRID - 1 {
+            for x in 0..WGRID - 1 {
+                let a = y * WGRID + x;
+                widx.extend_from_slice(&[a, a + 1, a + WGRID, a + WGRID, a + 1, a + WGRID + 1]);
+            }
+        }
+        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water-indices"),
+            contents: bytemuck::cast_slice(&widx),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
         let lights_static = super::SpritePass::new(
             device,
             globals,
@@ -482,6 +550,11 @@ impl TokyoPass {
             ground_pl,
             bldg_pl,
             road_pl,
+            water_pl,
+            water_bgl,
+            water_bg: None,
+            water_ibuf,
+            water_n_idx: widx.len() as u32,
             bldg: Vec::new(),
             roads: None,
             lights_static,
@@ -723,6 +796,43 @@ impl TokyoPass {
         cp.dispatch_workgroups(DROPS.div_ceil(256), 1, 1);
     }
 
+    pub fn rain_view(&self) -> wgpu::TextureView {
+        self.rain_tex
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    pub fn set_water(
+        &mut self,
+        device: &wgpu::Device,
+        globals: &wgpu::Buffer,
+        map: &wgpu::Buffer,
+        sim_view: &wgpu::TextureView,
+        samp: &wgpu::Sampler,
+    ) {
+        self.water_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tokyo-water"),
+            layout: &self.water_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: globals.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(samp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: map.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(sim_view),
+                },
+            ],
+        }));
+    }
+
     pub fn upload_roads(&mut self, device: &wgpu::Device, verts: &[[f32; 4]], indices: &[u32]) {
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("road-verts"),
@@ -757,6 +867,12 @@ impl TokyoPass {
                 rp.set_index_buffer(tile.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..tile.n_indices, 0, 0..1);
             }
+        }
+        if let Some(bg) = &self.water_bg {
+            rp.set_pipeline(&self.water_pl);
+            rp.set_bind_group(0, bg, &[]);
+            rp.set_index_buffer(self.water_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            rp.draw_indexed(0..self.water_n_idx, 0, 0..1);
         }
         self.lights_static.record(rp);
         self.lights_cars.record(rp);
